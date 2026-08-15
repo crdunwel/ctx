@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    env:
+      CTX_HOME: ${{ runner.temp }}/ctx-home
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install .
+      - name: Test
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -q
+      - name: Validate repository context
+        run: ctx validate . --strict
+      - name: Verify repository context freshness
+        run: ctx status . --check
+      - name: Build wheel
+        run: python -m pip wheel --no-deps . --wheel-dir dist
+      - name: Smoke-test entry points
+        run: |
+          ctx --version
+          context-hydrate --version

@@ -13,6 +13,7 @@ from unittest import mock
 
 from ctx import retrofit_agent
 from ctx.diagnostics import CtxError
+from ctx.freshness import seal_freshness
 
 
 EXPECTED_CODEX_HOOKS = {
@@ -171,8 +172,69 @@ node:
   name: Beta
 """
 
+
+def evidence_areas(relative: str) -> list[str]:
+    parts = relative.split("/")
+    if len(parts) == 1:
+        return ["."]
+    areas = [parts[0]]
+    if len(parts) >= 3 and not parts[0].casefold().endswith(
+        (".xcodeproj", ".xcworkspace")
+    ):
+        areas.append("/".join(parts[:2]))
+    return areas
+
+
+catalog = json.loads(
+    (workspace / ".ctx-retrofit-evidence.json").read_text(encoding="utf-8")
+)
+source_entries = [
+    entry
+    for entry in catalog["files"]
+    if not str(entry["path"]).startswith(".ctx/")
+]
+areas = sorted(
+    {
+        area
+        for entry in source_entries
+        for area in evidence_areas(str(entry["path"]))
+    }
+)
+coverage = []
+for area in areas:
+    entries = [
+        entry
+        for entry in source_entries
+        if area in evidence_areas(str(entry["path"]))
+    ]
+    copied = [entry for entry in entries if entry["representation"] == "copied"]
+    previewed = [entry for entry in entries if entry["representation"] == "preview"]
+    if copied:
+        disposition = "excluded"
+        evidence = [str(copied[0]["path"])]
+    elif previewed:
+        disposition = "excluded"
+        evidence = [str(previewed[0]["path"])]
+    else:
+        disposition = "unresolved"
+        evidence = [str(entries[0]["path"])]
+    coverage.append(
+        {
+            "area": area,
+            "disposition": disposition,
+            "scope": None,
+            "evidence": evidence,
+            "summary": f"Deterministic fake review for {area}.",
+        }
+    )
+
 mode = os.environ.get("FAKE_CODEX_MODE", "valid")
 if mode == "fail":
+    print("RAW CODEX BANNER " + ("x" * 5_000), file=sys.stderr)
+    print(
+        "ERROR invalid_json_schema: uniqueItems is not permitted",
+        file=sys.stderr,
+    )
     Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         json.dumps(invocation_record(), ensure_ascii=True, sort_keys=True)
         + "\\n",
@@ -208,6 +270,69 @@ else:
         ],
         "summary": "Proposed one evidence-backed project root.",
     }
+
+valid_scopes = {
+    str(item["path"])
+    for item in proposal["manifests"]
+    if str(item["path"]).endswith(".ctx/context.yaml")
+}
+valid_scopes.update(
+    str(entry["path"])
+    for entry in catalog["files"]
+    if str(entry["path"]).endswith(".ctx/context.yaml")
+)
+for item in coverage:
+    area = item["area"]
+    direct = ".ctx/context.yaml" if area == "." else f"{area}/.ctx/context.yaml"
+    if direct in valid_scopes:
+        item["disposition"] = "node"
+        item["scope"] = direct
+        item["summary"] = "This area has a direct context scope."
+        continue
+    ancestors = []
+    parts = [] if area == "." else area.split("/")
+    for length in range(len(parts)):
+        ancestor = "/".join(parts[:length])
+        candidate = (
+            ".ctx/context.yaml"
+            if not ancestor
+            else f"{ancestor}/.ctx/context.yaml"
+        )
+        if candidate in valid_scopes:
+            ancestors.append(candidate)
+    if ancestors:
+        item["disposition"] = "ancestor-covered"
+        item["scope"] = ancestors[-1]
+        item["summary"] = "The proposed ancestor scope intentionally covers this area."
+
+if mode == "root-only-uncovered":
+    for item in coverage:
+        if item["area"] != ".":
+            item["disposition"] = "unresolved"
+            item["scope"] = None
+            item["summary"] = "The root-only proposal did not cover this area."
+
+proposal["coverage"] = coverage
+proposal["conflicts"] = []
+if mode == "review-required":
+    inspected = next(
+        (
+            str(entry["path"])
+            for entry in source_entries
+            if entry["representation"] in {"copied", "preview"}
+        ),
+        None,
+    )
+    if inspected is None:
+        raise RuntimeError("review-required fixture needs inspected evidence")
+    proposal["conflicts"] = [
+        {
+            "id": "contract-disagreement",
+            "status": "review-required",
+            "evidence": [inspected],
+            "summary": "The documented and implemented contracts need human review.",
+        }
+    ]
 
 result_path.write_text(
     json.dumps(proposal, ensure_ascii=True, sort_keys=True) + "\\n",
@@ -361,9 +486,68 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         schema = invocation["schema"]
         self.assertIsInstance(schema, dict)
         assert isinstance(schema, dict)
-        self.assertEqual(schema["required"], ["manifests", "summary"])
+        self.assert_structured_output_schema_subset(schema)
+        self.assertEqual(
+            schema["required"],
+            ["manifests", "summary", "coverage", "conflicts"],
+        )
+        coverage_schema = schema["properties"]["coverage"]["items"]
+        self.assertEqual(
+            coverage_schema["required"],
+            ["area", "disposition", "scope", "evidence", "summary"],
+        )
+        self.assertEqual(
+            coverage_schema["properties"]["disposition"]["enum"],
+            ["node", "ancestor-covered", "excluded", "unresolved"],
+        )
+        self.assertIn("transient semantic-review record", normalized_prompt)
+        self.assertIn(
+            "proposed/existing `.ctx/context.yaml` path", normalized_prompt
+        )
         self.assertEqual(schema["additionalProperties"], False)
         return snapshot_root
+
+    def assert_structured_output_schema_subset(self, schema: dict[str, object]) -> None:
+        """Keep the Codex transport schema inside its accepted strict subset."""
+
+        allowed = {
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "items",
+            "enum",
+            "anyOf",
+            "minItems",
+            "maxItems",
+            "pattern",
+        }
+
+        def visit(value: object) -> None:
+            self.assertIsInstance(value, dict)
+            assert isinstance(value, dict)
+            self.assertTrue(
+                set(value).issubset(allowed),
+                f"unsupported strict-schema keywords: {sorted(set(value) - allowed)}",
+            )
+            properties = value.get("properties", {})
+            self.assertIsInstance(properties, dict)
+            assert isinstance(properties, dict)
+            for child in properties.values():
+                visit(child)
+            items = value.get("items")
+            if items is not None:
+                visit(items)
+            alternatives = value.get("anyOf", [])
+            self.assertIsInstance(alternatives, list)
+            assert isinstance(alternatives, list)
+            for child in alternatives:
+                visit(child)
+
+        visit(schema)
+        encoded = json.dumps(schema, sort_keys=True)
+        self.assertNotIn('"uniqueItems"', encoded)
+        self.assertNotIn('"maxLength"', encoded)
 
     def assert_agent_snapshot_was_read_only(
         self, invocation: dict[str, object]
@@ -418,6 +602,11 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ctx retrofit: inventorying project", result.stderr)
+        self.assertIn("prepared bounded read-only snapshot", result.stderr)
+        self.assertIn("starting Codex semantic review", result.stderr)
+        self.assertIn("semantic review finished; validating", result.stderr)
+        self.assertNotIn("ctx retrofit:", result.stdout)
         invocation = self.read_invocation(record)
         self.assert_workspace_invocation(invocation, project)
         self.assert_agent_snapshot_was_read_only(invocation)
@@ -440,6 +629,12 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("RETROFIT UNCHANGED", second.stdout)
         self.assertIn("no agent needed", second.stdout)
+        self.assertIn("Try the context now (read-only):", second.stdout)
+        self.assertIn("ctx status ", second.stdout)
+        self.assertIn("ctx doctor ", second.stdout)
+        self.assertIn("ctx hydrate --from ", second.stdout)
+        self.assertIn("ctx retrofit review ", second.stdout)
+        self.assertEqual(second.stderr, "")
 
     def test_fresh_existing_project_installs_missing_hooks_idempotently(self) -> None:
         project = self.base / "fresh-existing-project"
@@ -483,6 +678,141 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assertIn("hooks unchanged", repeated.stdout)
         self.assertEqual(hooks_path.read_bytes(), before)
         self.assertFalse(record.exists(), "an idempotent retrofit must not restart the agent")
+
+    def test_default_reuses_canonical_user_hooks_without_project_duplicate(self) -> None:
+        project = self.base / "user-hook-project"
+        project.mkdir()
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        installed = self.run_ctx("integrate", "codex", "--hooks", "--user")
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        executable_directory, record = self.install_fake_codex()
+
+        result = self.run_ctx(
+            "retrofit",
+            str(project),
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("user-wide; no duplicate project hook created", result.stdout)
+        self.assertFalse((project / ".codex").exists())
+        self.assertTrue((self.home / ".codex" / "hooks.json").is_file())
+
+    def test_fresh_review_plan_adds_node_and_refreshes_existing_lock(self) -> None:
+        project = self.base / "fresh-review-project"
+        root_manifest = project / ".ctx" / "context.yaml"
+        root_manifest.parent.mkdir(parents=True)
+        feature = project / "feature"
+        feature.mkdir()
+        (project / "app.py").write_text("ROOT = True\n", encoding="utf-8")
+        (feature / "screen.py").write_text("SCREEN = True\n", encoding="utf-8")
+        original_manifest = (
+            "version: 1\n"
+            "project:\n"
+            "  id: existing-project\n"
+            "  name: Existing Project\n"
+            "  aliases: []\n"
+            "node:\n"
+            "  id: root\n"
+            "  name: Existing Project\n"
+        )
+        root_manifest.write_text(original_manifest, encoding="utf-8")
+        original_lock = seal_freshness(project).path.read_bytes()
+        executable_directory, record = self.install_fake_codex()
+
+        reviewed = self.run_ctx(
+            "retrofit",
+            "review",
+            str(project),
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="nested-only",
+            ),
+        )
+
+        self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
+        self.assertIn("RETROFIT REVIEW", reviewed.stdout)
+        self.assertFalse((feature / ".ctx").exists())
+        plan_id = reviewed.stdout.split("ctx retrofit --apply ", 1)[1].split()[0]
+
+        applied = self.run_ctx("retrofit", "--apply", plan_id)
+
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertTrue((feature / ".ctx" / "context.yaml").is_file())
+        self.assertEqual(root_manifest.read_text(encoding="utf-8"), original_manifest)
+        self.assertNotEqual(
+            (project / ".ctx" / "lock.json").read_bytes(), original_lock
+        )
+        status = self.run_ctx("status", str(project), "--check", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertTrue(json.loads(status.stdout)["fresh"])
+
+    def test_fresh_review_failure_restores_lock_and_missing_node(self) -> None:
+        project = self.base / "fresh-review-rollback-project"
+        root_manifest = project / ".ctx" / "context.yaml"
+        root_manifest.parent.mkdir(parents=True)
+        feature = project / "feature"
+        feature.mkdir()
+        (project / "app.py").write_text("ROOT = True\n", encoding="utf-8")
+        (feature / "screen.py").write_text("SCREEN = True\n", encoding="utf-8")
+        manifest_content = (
+            "version: 1\n"
+            "project:\n"
+            "  id: existing-project\n"
+            "  name: Existing Project\n"
+            "  aliases: []\n"
+            "node:\n"
+            "  id: root\n"
+            "  name: Existing Project\n"
+        )
+        root_manifest.write_text(manifest_content, encoding="utf-8")
+        lock_path = seal_freshness(project).path
+        original_lock = lock_path.read_bytes()
+        executable_directory, record = self.install_fake_codex()
+        reviewed = self.run_ctx(
+            "retrofit",
+            "review",
+            str(project),
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="nested-only",
+            ),
+        )
+        self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
+        plan_id = reviewed.stdout.split("ctx retrofit --apply ", 1)[1].split()[0]
+
+        conflicting = self.base / "conflicting-registration"
+        conflicting_manifest = conflicting / ".ctx" / "context.yaml"
+        conflicting_manifest.parent.mkdir(parents=True)
+        (conflicting / "app.py").write_text("OTHER = True\n", encoding="utf-8")
+        conflicting_manifest.write_text(manifest_content, encoding="utf-8")
+        registered = self.run_ctx("register", str(conflicting))
+        self.assertEqual(
+            registered.returncode, 0, registered.stdout + registered.stderr
+        )
+
+        applied = self.run_ctx("retrofit", "--apply", plan_id)
+
+        self.assertEqual(applied.returncode, 3, applied.stdout + applied.stderr)
+        self.assertIn("registry.project-conflict", applied.stderr)
+        self.assertEqual(lock_path.read_bytes(), original_lock)
+        self.assertFalse((feature / ".ctx").exists())
+        self.assertFalse((project / ".codex").exists())
+        registry = json.loads(
+            (self.ctx_home / "registry.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            Path(registry["projects"]["existing-project"]["root"]),
+            conflicting.resolve(),
+        )
 
     def test_no_hooks_opt_out_completes_retrofit_without_codex_integration(self) -> None:
         project = self.base / "agent-neutral-project"
@@ -766,7 +1096,7 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         plan_id = result.stdout.split("ctx retrofit --apply ", 1)[1].split()[0]
         plan_path = self.ctx_home / "retrofit-plans" / f"{plan_id}.json"
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        self.assertEqual(plan["schema"], "ctx-retrofit-plan/v1")
+        self.assertEqual(plan["schema"], "ctx-retrofit-plan/v2")
         self.assertEqual(plan["root"], str(project.resolve()))
         planned_content = plan["manifests"][0]["content"]
 
@@ -800,6 +1130,94 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assertTrue((self.ctx_home / "registry.json").is_file())
         self.assert_canonical_project_hooks(project)
         self.assertIn("hooks created", applied.stdout)
+
+    def test_root_only_dry_run_exposes_unresolved_inventory_areas(self) -> None:
+        project = self.base / "root-only-coverage-project"
+        (project / "VetInventory" / "Features").mkdir(parents=True)
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        (project / "VetInventory" / "Features" / "screen.py").write_text(
+            "SCREEN = 'inventory'\n", encoding="utf-8"
+        )
+        executable_directory, record = self.install_fake_codex()
+
+        result = self.run_ctx(
+            "retrofit",
+            str(project),
+            "--dry-run",
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="root-only-uncovered",
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("unresolved coverage VetInventory, VetInventory/Features", result.stdout)
+        self.assertIn("Apply blocked", result.stdout)
+        self.assertNotIn("Apply exact proposal", result.stdout)
+        plan_id = result.stdout.split("ctx retrofit --show-plan ", 1)[1].split()[0]
+        shown = self.run_ctx("retrofit", "--show-plan", plan_id)
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        plan = json.loads(shown.stdout)
+        self.assertTrue(plan["review_required"])
+        self.assertIn(
+            {
+                "area": "VetInventory/Features",
+                "disposition": "unresolved",
+                "scope": None,
+                "evidence": ["VetInventory/Features/screen.py"],
+                "summary": "The root-only proposal did not cover this area.",
+            },
+            plan["coverage"],
+        )
+        root_coverage = next(item for item in plan["coverage"] if item["area"] == ".")
+        self.assertEqual(root_coverage["disposition"], "node")
+        self.assertEqual(root_coverage["scope"], ".ctx/context.yaml")
+
+        applied = self.run_ctx("retrofit", "--apply", plan_id)
+        self.assertEqual(applied.returncode, 1, applied.stdout + applied.stderr)
+        self.assertIn("retrofit.review-required", applied.stderr)
+        self.assertIn("area:VetInventory", applied.stderr)
+        self.assertFalse((project / ".ctx").exists())
+
+    def test_review_required_saved_plan_cannot_publish_or_finalize(self) -> None:
+        project = self.base / "review-required-project"
+        project.mkdir()
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        executable_directory, record = self.install_fake_codex()
+
+        dry_run = self.run_ctx(
+            "retrofit",
+            str(project),
+            "--dry-run",
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="review-required",
+            ),
+        )
+
+        self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+        self.assertIn("review-required conflicts contract-disagreement", dry_run.stdout)
+        self.assertIn("Apply blocked", dry_run.stdout)
+        self.assertNotIn("Apply exact proposal", dry_run.stdout)
+        plan_id = dry_run.stdout.split("ctx retrofit --show-plan ", 1)[1].split()[0]
+        shown = self.run_ctx("retrofit", "--show-plan", plan_id)
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        self.assertTrue(json.loads(shown.stdout)["review_required"])
+
+        record.unlink()
+        applied = self.run_ctx("retrofit", "--apply", plan_id)
+
+        self.assertEqual(applied.returncode, 1, applied.stdout + applied.stderr)
+        self.assertIn("retrofit.review-required", applied.stderr)
+        self.assertIn("contract-disagreement", applied.stderr)
+        self.assertFalse((project / ".ctx").exists())
+        self.assertFalse((project / ".codex").exists())
+        self.assertFalse((self.ctx_home / "registry.json").exists())
+        self.assertFalse(record.exists(), "applying a blocked plan must not restart Codex")
 
     def test_dry_run_no_hooks_retains_opt_out_in_apply_command(self) -> None:
         project = self.base / "dry-run-no-hooks-project"
@@ -955,6 +1373,9 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
 
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertIn("retrofit.agent-failed", result.stderr)
+        self.assertIn("invalid_json_schema: uniqueItems is not permitted", result.stderr)
+        self.assertNotIn("RAW CODEX BANNER", result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertTrue(record.is_file())
         invocation = self.read_invocation(record)
         self.assert_workspace_invocation(invocation, project)
@@ -962,6 +1383,70 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assert_live_target_unchanged_during_agent(invocation)
         self.assert_agent_observed_no_ctx(invocation)
         self.assertFalse((project / ".ctx").exists())
+
+    def test_agent_wait_emits_elapsed_heartbeat(self) -> None:
+        class WaitingProcess:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.timeouts: list[float | None] = []
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.calls += 1
+                self.timeouts.append(timeout)
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired("codex", timeout)
+                return 0
+
+        process = WaitingProcess()
+        progress: list[str] = []
+        with mock.patch.object(
+            retrofit_agent.time,
+            "monotonic",
+            side_effect=[100.0, 100.0, 110.4, 110.4],
+        ):
+            returncode = retrofit_agent._wait_for_agent(  # type: ignore[arg-type]
+                process,
+                progress=progress.append,
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(process.timeouts[0], retrofit_agent.AGENT_HEARTBEAT_SECONDS)
+        self.assertEqual(
+            progress,
+            ["Codex semantic review still running (10s elapsed; Ctrl-C to stop)"],
+        )
+
+    def test_agent_wait_kills_child_on_keyboard_interrupt(self) -> None:
+        class InterruptedProcess:
+            def __init__(self) -> None:
+                self.killed = False
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is not None:
+                    raise KeyboardInterrupt
+                return -9
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = InterruptedProcess()
+        progress: list[str] = []
+        with mock.patch.object(
+            retrofit_agent.time,
+            "monotonic",
+            side_effect=[100.0, 100.0],
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                retrofit_agent._wait_for_agent(  # type: ignore[arg-type]
+                    process,
+                    progress=progress.append,
+                )
+
+        self.assertTrue(process.killed)
+        self.assertEqual(
+            progress,
+            ["Codex semantic review interrupted; cleaning up"],
+        )
 
     def test_invalid_proposal_is_never_applied(self) -> None:
         project = self.base / "invalid-proposal"

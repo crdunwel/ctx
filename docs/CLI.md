@@ -36,6 +36,15 @@ ctx status
 ctx reconcile
 ```
 
+For an immediate, model-free proof that an existing graph is useful, run:
+
+```text
+ctx hydrate --task "Orient me to this project and identify the best next scope"
+```
+
+This prints the same bounded packet an integrated agent receives. It requires
+no Codex hook support and works on every surface where the agent can run a CLI.
+
 - `ctx demo` creates a complete, model-free Permit Board sample with working
   source and tests, root and policy context nodes, canonical project Codex
   hooks, and a fresh lock. It never overwrites an existing path.
@@ -48,7 +57,9 @@ ctx reconcile
   node and ancestors, plus a derived routing-only index of the nearest node's
   immediate semantic children. Child content remains dormant. It includes
   another project only when the user names it or supplies `--include`; an
-  authored link remains a reference until explicitly selected.
+  authored link remains a reference until explicitly selected. An external
+  filesystem include must belong to a registered checkout and inherits that
+  registry entry's trust and reuse policy.
 - `ctx show` displays the current directory's inherited context. A path or
   `ctx://` reference selects something else.
 - `ctx status` reports current freshness. `--check` is the CI form and fails
@@ -63,7 +74,9 @@ may incur local or provider cost. A `--dry-run` prevents project mutation, not
 provider access. Retrofit `--dry-run` saves a content-addressed proposal under
 `CTX_HOME`; `--show-plan PLAN_ID` prints its paths and YAML as terminal-safe
 JSON, and `--apply PLAN_ID` applies that exact proposal without a second agent
-call after rejecting a changed project as stale. Reconcile `--dry-run` validates
+call after rejecting a changed project as stale. The saved plan also shows the
+transient structural-area dispositions and evidence-backed conflict review;
+unresolved areas or review-required conflicts block application. Reconcile `--dry-run` validates
 a transient proposal and reports only counts and the sanitized agent summary;
 it does not save or print exact proposed YAML in this alpha. `--prompt` prints a
 standalone agent-neutral prompt and invokes no agent. V1 ships one guarded
@@ -73,8 +86,10 @@ unsupported names instead of silently weakening the sandbox. Other agents use
 
 Automated agent modes fingerprint every eligible, nonignored regular file, then
 make a deterministic bounded selection available to the configured model
-through a filtered temporary snapshot. Complete source and governing files are
-prioritized fairly across project areas. Non-governing text files over 2 MiB
+through a filtered temporary snapshot. Retrofit prioritizes complete source and
+governing files fairly across bounded hierarchical project areas. Reconciliation
+copies only affected-node ownership, declared evidence, and mandatory context
+while retaining the complete fingerprint for race detection. Non-governing text files over 2 MiB
 and large structured data may be rendered as labeled bounded previews; media,
 archives, databases, duplicate content, and protected top-level data may be
 represented only by path/size/hash metadata or a small representative sample.
@@ -102,7 +117,7 @@ portable handoff.
 ```text
 ctx demo [PATH]
 ctx retrofit [PATH] [--dry-run | --apply PLAN_ID | --show-plan PLAN_ID | --prompt]
-                    [--agent AGENT] [--no-hooks]
+                    [--review] [--agent AGENT] [--no-hooks]
 ctx reconcile [TARGET] [--dry-run] [--prompt] [--agent AGENT]
                      [--acknowledge REASON]
 ctx status [TARGET] [--check] [--json]
@@ -117,12 +132,20 @@ The demo path defaults to `./ctx-permit-board-demo` and must not exist or be
 nested inside another ctx project. Demo creation is deterministic and invokes
 no model; it does not register the sample globally. `PATH` and `TARGET` on
 maintenance commands default to the current directory. Retrofit creates missing
-manifests only and, by default, installs the canonical project Codex hooks as
-part of the same rollback-safe lifecycle. `--no-hooks` is the explicit
-agent-neutral opt-out. Prompt, show-plan, and dry-run modes never install hooks;
+manifests only and, by default, enables canonical Codex hooks as part of the
+same rollback-safe lifecycle. It reuses an exact canonical user hook instead of
+creating a duplicate project hook; otherwise it installs the project hook.
+`--no-hooks` is the explicit agent-neutral opt-out. Prompt, show-plan, and dry-run modes never install hooks;
 applying a saved plan does unless `--no-hooks` is supplied. A different or
 unsafe existing hooks file is preserved and causes a clean failure instead of
-being merged or replaced. Bare `ctx reconcile` is the two-word guarded detached or
+being merged or replaced. `ctx retrofit review [PATH]` forces a dry-run against
+an already-fresh graph so missing semantic scopes can be proposed without
+overwriting existing manifests; review and apply its saved plan separately.
+Agent-backed runs print concise stages and a ten-second elapsed heartbeat on
+stderr. Raw Codex transcript output is suppressed; `Ctrl-C` terminates and
+reaps the child before any proposal is published, and failures expose only a
+bounded relevant diagnostic.
+Bare `ctx reconcile` is the two-word guarded detached or
 human-initiated update path for existing manifests; it is not shorthand for a
 run-scoped subcommand. `--acknowledge REASON` is its explicit escape hatch when
 every currently affected node has been reviewed and no manifest edit is
@@ -186,12 +209,15 @@ syntax `ctx node init ...` remains accepted.
 ### Diagnostics
 
 ```text
-ctx doctor [--json]
+ctx doctor [PATH] [--json]
 ```
 
 `doctor` checks the Python/PyYAML runtime, registry readability, and optional
-guarded Codex adapter. `ctx` itself stays headless, agent-neutral, and
-local-first. Retrofit, detached reconciliation, and `doctor` share one Codex
+guarded Codex adapter. From a ctx project it also safely compares project and
+user hooks with the canonical definition, warns when both scopes may execute,
+and reports that host trust is not inspectable. It never parses or follows an
+unsafe hook file. `ctx` itself stays headless, agent-neutral, and local-first.
+Retrofit, detached reconciliation, and `doctor` share one Codex
 executable resolver: an absolute `CTX_CODEX` override first, then `codex` on
 `PATH`, then the standard ChatGPT application bundle on macOS. An invalid
 override is an operational error rather than permission to fall back to a
@@ -213,12 +239,49 @@ the file exists. Codex can run multiple matching user and project hooks for one
 event, so callers must not assume the ctx hook is exclusive or rely on its
 ordering relative to other hooks.
 
+`ctx` does not install a `/ctx` slash command or add an item to the Codex
+command palette. This integration installs lifecycle command hooks only.
+
 Generated hooks execute `ctx` by name, so the hook process resolves whichever
 executable appears first on `PATH`. Before trusting hooks, inspect
 `.codex/hooks.json`, run `command -v ctx` and `ctx --version` in the intended
-environment, then run `/hooks` in Codex to review and trust the exact hook
-definitions. Review hook changes again after pulls or merges. User-wide hooks
-affect every workspace.
+environment, then start the Codex CLI/TUI in the project and run `/hooks` to
+review and trust the exact hook definitions. Review hook changes again after
+pulls or merges. User-wide hooks affect every workspace.
+
+Choose user-wide or project ctx hooks, not both. Codex launches matching hooks
+from multiple files concurrently; identical trusted definitions in
+`~/.codex/hooks.json` and `<repo>/.codex/hooks.json` therefore run hydration and
+stop checks twice. Project hooks are portable and versioned with one repository.
+For one-time setup across every ctx project, install the user hook once. Bare
+retrofit recognizes that exact canonical hook and does not create a project
+duplicate:
+
+```text
+ctx integrate codex --hooks --user
+ctx retrofit
+```
+
+The user-wide ctx hook exits successfully without adding context when the
+working directory is outside a ctx project. Keep only one ctx hook definition
+trusted for any particular repository.
+
+The documented `/hooks` browser is a Codex CLI/TUI command. The Codex desktop
+app does not currently expose it in its documented developer-command surface,
+so do not use `/hooks` as a desktop setup step. Explicit ctx commands remain
+fully usable there:
+
+```text
+ctx hydrate --task "Describe the work I am about to do"
+ctx status --check
+```
+
+An agent can perform the same step when prompted to run `ctx hydrate` before it
+reads or edits source. Until desktop exposes hook review, automatic prompt and
+stop integration should be treated as a Codex CLI/TUI convenience, not as a
+portable requirement. See the official [Codex hooks
+documentation](https://learn.chatgpt.com/docs/hooks) and [developer-command
+reference](https://learn.chatgpt.com/docs/developer-commands?surface=app).
 
 On `UserPromptSubmit`, the ctx hook begins or reuses the task's stable run,
 captures the immutable pre-edit filesystem baseline before work starts, and
@@ -246,6 +309,9 @@ acknowledge an implementation-only change.
 
 - `ctx retrofit prompt [PATH]` remains an alias for
   `ctx retrofit [PATH] --prompt`.
+- `ctx retrofit review [PATH]` runs a mandatory dry-run even when the existing
+  graph is fresh. It may propose only missing manifests and produces an exact
+  saved plan for review and later `--apply`.
 - `ctx node init [PATH] ...` remains an alias for `ctx node [PATH] ...`.
 - `ctx use REF --for TASK --from PATH` remains an alias for hydration, but new
   documentation uses `ctx hydrate`.

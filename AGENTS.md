@@ -241,7 +241,7 @@ project/src/forms/.ctx/context.yaml
 
 V1 scans the small YAML manifests of eligible registered projects directly. Do not add an index until the benchmark milestone proves it necessary.
 
-Search project IDs/names/aliases; node IDs/names/summaries; item IDs/titles/summaries; and artifact paths/roles. Exact URI, project, ID, alias, and title matches outrank prefix and broad token matches. Prefer an explicitly selected project and use URI order as the final tie breaker. Return URI, title, summary, project, node, and policy. Ambiguous leaders return candidates, never a silent choice.
+Search project IDs/names/aliases; node IDs/names/summaries; item IDs/titles/summaries; and artifact paths/roles. Exact URI, project, ID, alias, and title matches outrank prefix and broad token matches. Multi-token matches must be coherent within one field rather than assembled from unrelated artifact roles. Prefer an explicitly selected project and use URI order as the final tie breaker. Return URI, title, summary, project, node, policy, and compact match evidence. Ambiguous leaders return candidates, never a silent choice.
 
 Examples:
 
@@ -266,7 +266,7 @@ ctx hydrate --from PATH --task "TASK" [--include REFERENCE] [--budget 8000]
 ctx use "permit atlas form section" --for "Build onboarding" --from .
 ```
 
-Recognize explicit project aliases and `ctx://` references in the task. Do not treat ordinary lexical similarity as consent to search the entire registry.
+Recognize explicit project aliases and `ctx://` references in the task. Within the current project, an exact unique node or item ID/title in task text may select that local scope. A weak or tied task match remains dormant and emits candidates or a warning instead of silently selecting one. Do not treat ordinary lexical similarity as consent to search the entire registry.
 
 Hydration emits deterministic Markdown suitable for developer context. Begin every packet with this immutable warning:
 
@@ -305,6 +305,8 @@ ctx use REFERENCE --for TASK --from PATH [--budget N]
 ctx validate [PATH] [--strict] [--json]
 ctx retrofit prompt [PATH]
 ctx retrofit [PATH] [--no-hooks]
+ctx retrofit review [PATH]
+ctx doctor [PATH] [--json]
 ctx begin --from PATH --task TASK [--session ID] [--turn ID] [--json]
 ctx status [PATH_OR_PROJECT] [--check] [--json]
 ctx reconcile inspect [REFERENCE] [--run ID|--current-turn|--staged|--since REF]
@@ -354,18 +356,36 @@ The prompt warns against per-directory nodes, copied source, transient state, in
 
 When `ctx retrofit [PATH]` is used, the resolved local agent inspects
 a filtered temporary copy under a workspace-scoped read-only permission profile
-and returns a bounded structured proposal.
+and returns a bounded structured proposal. Alongside missing manifests, the
+transient proposal must disposition every bounded structural review area as its
+own node, intentionally ancestor-covered, excluded, or unresolved; it must also
+report inspected material conflicts as resolved or review-required. These
+records never enter manifests. Unresolved areas or review-required conflicts
+block automatic publication but remain visible in an evidence-bound dry-run
+plan. `ctx retrofit review [PATH]` forces this dry-run review even for an
+already-fresh graph and may still create only missing manifests after the exact
+saved plan is separately applied.
 The CLI accepts only normalized, missing `.ctx/context.yaml` destinations,
-publishes them with no-clobber semantics, runs strict validation, installs the
-canonical project Codex hooks, creates the initial freshness lock, and registers
-the checkout. These lifecycle writes are create-only or idempotent and roll back
-with newly created manifests if a later step fails. Existing or unsafe hook
-configuration is preserved and causes a clean failure rather than a merge or
-replacement. `--no-hooks` explicitly opts out for an agent-neutral project;
+publishes them with no-clobber semantics, runs strict validation, enables the
+canonical Codex hooks, creates the initial freshness lock, and registers the
+checkout. A canonical user-wide ctx hook is reused instead of creating a
+duplicate project hook; otherwise retrofit creates the project hook. Existing
+noncanonical or unsafe project hook configuration is preserved and causes a
+clean failure rather than a merge or replacement. These lifecycle writes are
+create-only or idempotent and roll back with newly created manifests if a later
+step fails. `--no-hooks` explicitly opts out for an agent-neutral project;
 prompt and dry-run modes never install hooks. The agent never receives write
 access to source or protected manifests. Prompt generation remains model-free
 and agent-neutral; `ctx retrofit prompt` remains the portable handoff for any
 other agent.
+
+Agent-backed retrofit writes concise inventory, snapshot, agent, heartbeat,
+and validation progress to stderr while keeping result output on stdout. It
+captures rather than replays the agent transcript, surfaces only a bounded
+useful failure detail, and terminates and reaps the child on interruption before
+any proposal is published. The structured-output transport schema uses only the
+provider-supported subset; ctx still enforces all size, uniqueness, path,
+evidence, and semantic constraints locally before publication.
 
 ---
 
@@ -449,7 +469,7 @@ Do not run an LLM after every save. Files may be temporarily inconsistent during
 
 ### 13.1 Inspect
 
-`ctx reconcile inspect` reports the run, changed paths, pre-existing dirty paths, affected node URIs, current manifests, relevant item and artifact sections, compact diff statistics, and exact source inspection commands. It may state deterministic observations such as a tracked artifact moving. It must not claim that a lexical change is architectural.
+`ctx reconcile inspect` reports the run, changed paths, pre-existing dirty paths, affected node URIs, current manifests, relevant item and artifact sections, compact diff statistics, and exact source inspection commands. Guarded reconciliation fingerprints the complete eligible repository for race detection but exposes only affected-node ownership, declared evidence, and mandatory repository context in the model-visible source corpus. It may state deterministic observations such as a tracked artifact moving. It must not claim that a lexical change is architectural.
 
 ### 13.2 Semantic update or acknowledgment
 
@@ -480,13 +500,18 @@ It never modifies source, invokes a model, or commits changes.
 
 ## 14. Codex hook integration
 
-Provide project integration at `<repo>/.codex/hooks.json`. Successful guarded
-bare retrofit installs the canonical project hooks by default so the two-word
-workflow leaves a project ready for Codex; `--no-hooks` is the explicit opt-out.
-The standalone `ctx integrate codex --hooks` command remains available for
-existing projects and user-wide installation. Project hooks run only after the
-project and exact hook definitions are trusted. The agent-neutral CLI remains
-the source of all behavior.
+Provide project integration at `<repo>/.codex/hooks.json` and optional
+user-wide integration at `~/.codex/hooks.json`. Successful guarded bare retrofit
+reuses an exact canonical user-wide hook when present and otherwise installs the
+canonical project hooks, so the two-word workflow avoids duplicate callbacks;
+`--no-hooks` is the explicit opt-out. The standalone
+`ctx integrate codex --hooks` command remains available for an explicitly
+selected scope. Matching user and project hooks can both run, so `ctx doctor`
+reports duplicate canonical definitions and never claims to know Codex's trust
+state. Non-managed hooks run only after the host and exact hook definitions are
+trusted. `/hooks` is the Codex CLI/TUI trust browser, not a ctx command or a
+documented Codex desktop command. The agent-neutral CLI remains the source of
+all behavior, and explicit hydration works without hook activation.
 
 Use only `UserPromptSubmit` and `Stop` in V1:
 
@@ -577,7 +602,7 @@ Use isolated temporary `CTX_HOME` directories and Git/non-Git repositories; neve
 - foundation: safe parsing, init/node-init idempotency, ancestry order, deep discovery, stable IDs, path containment, validation, URI normalization, and JSON output;
 - registry/search: register/replace/unregister, stale roots, ID/alias collisions, exact-match ranking, ambiguity, deterministic order, and trust/reuse gates;
 - hydration: nearest-node activation, compact ancestor constraints, dormant descendants/siblings/link targets, exact URI and item evidence, alias, `--include`, explicit task intent, cycles, depth, budgets, untrusted-data rendering, and exclusion of ambient external projects;
-- retrofit: standalone evidence-seeking prompt, selective implementation/contract/integration/test/version artifact lenses, semantic-boundary discipline, ignored/secret exclusion, no source backlinks or existing-manifest rewrite, and strict-validation end to end;
+- retrofit: standalone evidence-seeking prompt, selective implementation/contract/integration/test/version artifact lenses, bounded hierarchical area dispositions, structured conflict review, semantic-boundary discipline, ignored/secret exclusion, fresh-graph review, no source backlinks or existing-manifest rewrite, and strict-validation end to end;
 - freshness: byte-identical lock output, nearest-node ownership, declared and item-associated shared artifacts, `.ctx` exclusion, edits/renames/deletes/merges/checkouts/non-Git changes, unknown after lock deletion, race rejection, affected-entry-only updates, transient acknowledgements, and refusal to seal invalid context;
 - runs/hooks: stable immutable baseline, pre-existing dirty attribution, bounded UserPromptSubmit hydration, no-change Stop, exactly one stale continuation with original run ID, `stop_hook_active`, successful completion, malformed input safety, and machine-clean hook JSON;
 - detached/adversarial: affected-manifest-only prompts, separate worktrees, malicious YAML as data, symlink/path escapes, large inputs, broken fragments, graph explosions, registry corruption, and stable `status --check` exits.
@@ -606,8 +631,8 @@ Build hydrate/use, external gates, progressive expansion, budgets, source/checko
 
 Build the model-free, create-only retrofit prompt, compact inventory,
 agent-neutral instructions, optional guarded local-agent adapter, optional Codex
-skill guidance, and docs. The guarded two-word adapter also enables canonical
-project hooks unless explicitly opted out. Gate: an agent retrofits a legacy
+skill guidance, and docs. The guarded two-word adapter also enables one
+canonical Codex hook scope unless explicitly opted out. Gate: an agent retrofits a legacy
 repo into a small valid boundary graph without changing source and the resulting
 project is immediately ready for trusted Codex hydration.
 

@@ -5,11 +5,17 @@ import hashlib
 import json
 import os
 import posixpath
+import secrets
 import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
+
+try:  # Directory advisory locks are unavailable on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility
+    fcntl = None  # type: ignore[assignment]
 
 from .diagnostics import CtxError, UnsafePathError
 from .models import LoadedNode
@@ -101,6 +107,25 @@ class LockResult:
     action: str
     path: Path
     status: ProjectStatus
+    content: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LockFileState:
+    content: bytes
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LockWriteResult:
+    action: str
+    content: bytes
+    previous: bytes | None
 
 
 def lock_path(root: Path) -> Path:
@@ -261,10 +286,16 @@ def _source_record(root_fd: int, relative: str) -> bytes:
     )
 
 
-def compute_fingerprints(validation: ValidationResult) -> dict[str, Fingerprints]:
+def source_ownership(
+    validation: ValidationResult,
+    *,
+    inventory: RetrofitInventory | None = None,
+) -> dict[str, frozenset[str]]:
+    """Return deterministic nearest-node source ownership for review routing."""
+
     root = validation.project_root
-    inventory = inventory_repository(root)
-    evidence_reasons = inventory_evidence_reasons(inventory)
+    selected_inventory = inventory or inventory_repository(root)
+    evidence_reasons = inventory_evidence_reasons(selected_inventory)
     if evidence_reasons:
         reasons = ", ".join(evidence_reasons) or "inventory bound reached"
         raise CtxError(
@@ -272,8 +303,8 @@ def compute_fingerprints(validation: ValidationResult) -> dict[str, Fingerprints
             f"cannot prove freshness from a partial source inventory: {reasons}",
             exit_code=4,
         )
-    files = set(inventory.eligible_files)
-    files.update(_tracked_symlinks(root, inventory))
+    files = set(selected_inventory.eligible_files)
+    files.update(_tracked_symlinks(root, selected_inventory))
     nodes = validation.nodes
     owned: dict[str, set[str]] = {node.uri: set() for node in nodes}
     physical = sorted(
@@ -312,6 +343,17 @@ def compute_fingerprints(validation: ValidationResult) -> dict[str, Fingerprints
                 require_exists=True,
             )
             owned[node.uri].add(resolved.relative_to(root).as_posix())
+    return {
+        uri: frozenset(sorted(paths))
+        for uri, paths in sorted(owned.items())
+    }
+
+
+def compute_fingerprints(validation: ValidationResult) -> dict[str, Fingerprints]:
+    root = validation.project_root
+    inventory = inventory_repository(root)
+    owned = source_ownership(validation, inventory=inventory)
+    nodes = validation.nodes
     root_fd = _open_directory_no_follow(root)
     if root_fd is None:
         raise CtxError(
@@ -347,21 +389,18 @@ def compute_fingerprints(validation: ValidationResult) -> dict[str, Fingerprints
 
 def _load_lock(
     root: Path, project_id: str
-) -> tuple[dict[str, dict[str, str]], bool, str | None]:
+) -> tuple[dict[str, dict[str, str]], bool, str | None, bytes | None]:
     path = lock_path(root)
-    if not path.exists() and not path.is_symlink():
-        return {}, False, "lock is missing"
-    if path.is_symlink():
-        return {}, False, "lock is a symlink"
     try:
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            return {}, False, "lock is not a regular file"
-        if metadata.st_size > MAX_LOCK_BYTES:
-            return {}, False, "lock exceeds its safety limit"
-        raw = json.loads(path.read_bytes().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return {}, False, f"lock is invalid: {exc}"
+        content = read_lock_bytes_no_follow(path, missing_ok=True)
+    except CtxError as exc:
+        return {}, False, f"lock is invalid: {exc.message}", None
+    if content is None:
+        return {}, False, "lock is missing", None
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {}, False, f"lock is invalid: {exc}", content
     if (
         type(raw) is not dict
         or set(raw) != {"schema", "project_id", "nodes"}
@@ -369,11 +408,11 @@ def _load_lock(
         or raw.get("project_id") != project_id
         or type(raw.get("nodes")) is not dict
     ):
-        return {}, False, "lock has an unsupported schema"
+        return {}, False, "lock has an unsupported schema", content
     nodes: dict[str, dict[str, str]] = {}
     for uri, value in raw["nodes"].items():
         if type(uri) is not str or type(value) is not dict:
-            return {}, False, "lock node entries are invalid"
+            return {}, False, "lock node entries are invalid", content
         source = value.get("source_fingerprint")
         context = value.get("context_fingerprint")
         if (
@@ -382,9 +421,9 @@ def _load_lock(
             or not source.startswith("sha256:")
             or not context.startswith("sha256:")
         ):
-            return {}, False, "lock fingerprints are invalid"
+            return {}, False, "lock fingerprints are invalid", content
         nodes[uri] = {"source_fingerprint": source, "context_fingerprint": context}
-    return nodes, True, None
+    return nodes, True, None, content
 
 
 def project_status(path: Path) -> ProjectStatus:
@@ -397,7 +436,7 @@ def project_status(path: Path) -> ProjectStatus:
             exit_code=3 if validation.unsafe else 1,
         )
     current = compute_fingerprints(validation)
-    locked, lock_valid, lock_error = _load_lock(
+    locked, lock_valid, lock_error, _locked_content = _load_lock(
         validation.project_root, validation.project.id
     )
     statuses: list[NodeStatus] = []
@@ -447,48 +486,382 @@ def project_status(path: Path) -> ProjectStatus:
     )
 
 
-def _write_lock(path: Path, payload: dict[str, Any]) -> str:
-    data = _canonical_json(payload)
-    existing = path.read_bytes() if path.exists() and not path.is_symlink() else None
-    if existing == data:
-        return "unchanged"
-    if path.is_symlink():
-        raise UnsafePathError("lock.symlink", f"lock cannot be a symlink: {path}")
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".lock.", suffix=".tmp")
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
-    except OSError as exc:
-        raise CtxError("lock.write-failed", f"cannot write freshness lock {path}: {exc}", exit_code=4) from exc
-    return "updated" if existing is not None else "created"
-
-
-def _restore_lock(path: Path, previous: bytes | None) -> None:
-    if previous is None:
-        path.unlink(missing_ok=True)
-        return
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=".lock.restore.", suffix=".tmp"
+def _lock_state_from_descriptor(descriptor: int, path: Path) -> _LockFileState:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise UnsafePathError("lock.not-regular", f"lock is not a regular file: {path}")
+    if before.st_size > MAX_LOCK_BYTES:
+        raise CtxError(
+            "lock.too-large",
+            f"lock exceeds its safety limit: {path}",
+            exit_code=4,
+        )
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_LOCK_BYTES:
+        chunk = os.read(descriptor, min(65_536, MAX_LOCK_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > MAX_LOCK_BYTES:
+        raise CtxError(
+            "lock.too-large",
+            f"lock exceeds its safety limit: {path}",
+            exit_code=4,
+        )
+    after = os.fstat(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        stat.S_IMODE(before.st_mode),
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
     )
-    temporary = Path(temporary_name)
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        stat.S_IMODE(after.st_mode),
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise CtxError(
+            "lock.concurrent-change",
+            f"freshness lock changed while it was being read: {path}",
+            exit_code=4,
+        )
+    return _LockFileState(
+        b"".join(chunks),
+        after.st_dev,
+        after.st_ino,
+        stat.S_IMODE(after.st_mode),
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+
+def _read_lock_at(
+    directory_fd: int,
+    name: str,
+    path: Path,
+) -> _LockFileState | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(previous)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        try:
+            failed_metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            failed_metadata = None
+        if failed_metadata is not None and stat.S_ISLNK(failed_metadata.st_mode):
+            raise UnsafePathError("lock.symlink", f"lock cannot be a symlink: {path}") from exc
+        raise CtxError(
+            "lock.read-failed",
+            f"cannot safely open freshness lock {path}: {exc}",
+            exit_code=4,
+        ) from exc
+    try:
+        return _lock_state_from_descriptor(descriptor, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(descriptor)
 
 
-def seal_freshness(path: Path) -> LockResult:
+def _read_lock_fallback(path: Path) -> _LockFileState | None:
+    """Best available final-component protection where dir_fd is unavailable."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if path.is_symlink():
+            raise UnsafePathError("lock.symlink", f"lock cannot be a symlink: {path}") from exc
+        raise CtxError(
+            "lock.read-failed",
+            f"cannot safely open freshness lock {path}: {exc}",
+            exit_code=4,
+        ) from exc
+    try:
+        return _lock_state_from_descriptor(descriptor, path)
+    finally:
+        os.close(descriptor)
+
+
+def read_lock_bytes_no_follow(path: Path, *, missing_ok: bool = False) -> bytes | None:
+    """Read exact lock bytes without following the lock or parent symlinks."""
+
+    try:
+        directory_fd = _open_directory_no_follow(path.parent)
+    except OSError as exc:
+        raise UnsafePathError(
+            "lock.parent-unsafe",
+            f"cannot safely open freshness lock directory {path.parent}: {exc}",
+        ) from exc
+    if directory_fd is None:
+        state = _read_lock_fallback(path)
+    else:
+        try:
+            state = _read_lock_at(directory_fd, path.name, path)
+        finally:
+            os.close(directory_fd)
+    if state is None and not missing_ok:
+        raise CtxError(
+            "lock.missing",
+            f"freshness lock is missing: {path}",
+            exit_code=4,
+        )
+    return None if state is None else state.content
+
+
+def _same_lock_state(
+    first: _LockFileState | None,
+    second: _LockFileState | None,
+) -> bool:
+    return first == second
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:  # pragma: no cover - defensive OS boundary
+            raise OSError("short write while writing freshness lock")
+        remaining = remaining[written:]
+
+
+def _replace_lock_bytes_at(
+    directory_fd: int,
+    path: Path,
+    replacement: bytes | None,
+    *,
+    expected_previous: bytes | None | object,
+    mismatch_code: str,
+    mismatch_message: str,
+) -> _LockWriteResult:
+    if fcntl is not None:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+    initial = _read_lock_at(directory_fd, path.name, path)
+    initial_content = None if initial is None else initial.content
+    if expected_previous is not _ANY_LOCK and initial_content != expected_previous:
+        raise CtxError(mismatch_code, mismatch_message, exit_code=4)
+    if replacement == initial_content:
+        return _LockWriteResult("unchanged", replacement or b"", initial_content)
+
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    try:
+        if replacement is not None:
+            temporary_name = f".lock.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            try:
+                _write_all(descriptor, replacement)
+                os.fsync(descriptor)
+                metadata = os.fstat(descriptor)
+                temporary_identity = (metadata.st_dev, metadata.st_ino)
+            finally:
+                os.close(descriptor)
+
+        current = _read_lock_at(directory_fd, path.name, path)
+        if not _same_lock_state(initial, current):
+            raise CtxError(mismatch_code, mismatch_message, exit_code=4)
+
+        if replacement is None:
+            if current is not None:
+                os.unlink(path.name, dir_fd=directory_fd)
+            action = "removed"
+        else:
+            assert temporary_name is not None
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            temporary_name = None
+            action = "updated" if initial is not None else "created"
+        os.fsync(directory_fd)
+
+        written = _read_lock_at(directory_fd, path.name, path)
+        if replacement is None:
+            if written is not None:
+                raise CtxError(mismatch_code, mismatch_message, exit_code=4)
+            return _LockWriteResult(action, b"", initial_content)
+        if (
+            written is None
+            or written.content != replacement
+            or temporary_identity != (written.device, written.inode)
+        ):
+            raise CtxError(mismatch_code, mismatch_message, exit_code=4)
+        return _LockWriteResult(action, replacement, initial_content)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+_ANY_LOCK = object()
+
+
+def _replace_lock_bytes(
+    path: Path,
+    replacement: bytes | None,
+    *,
+    expected_previous: bytes | None | object = _ANY_LOCK,
+    mismatch_code: str = "lock.concurrent-change",
+    mismatch_message: str | None = None,
+) -> _LockWriteResult:
+    if replacement is not None and len(replacement) > MAX_LOCK_BYTES:
+        raise CtxError(
+            "lock.too-large",
+            f"refusing to write a freshness lock over the safety limit: {path}",
+            exit_code=4,
+        )
+    message = mismatch_message or f"freshness lock changed concurrently: {path}"
+    try:
+        directory_fd = _open_directory_no_follow(path.parent)
+    except OSError as exc:
+        raise UnsafePathError(
+            "lock.parent-unsafe",
+            f"cannot safely open freshness lock directory {path.parent}: {exc}",
+        ) from exc
+    if directory_fd is None:  # pragma: no cover - Windows compatibility
+        initial = _read_lock_fallback(path)
+        initial_content = None if initial is None else initial.content
+        if expected_previous is not _ANY_LOCK and initial_content != expected_previous:
+            raise CtxError(mismatch_code, message, exit_code=4)
+        if replacement == initial_content:
+            return _LockWriteResult("unchanged", replacement or b"", initial_content)
+        temporary: Path | None = None
+        temporary_identity: tuple[int, int] | None = None
+        try:
+            if replacement is not None:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    dir=path.parent,
+                    prefix=".lock.",
+                    suffix=".tmp",
+                )
+                temporary = Path(temporary_name)
+                try:
+                    _write_all(descriptor, replacement)
+                    os.fsync(descriptor)
+                    metadata = os.fstat(descriptor)
+                    temporary_identity = (metadata.st_dev, metadata.st_ino)
+                finally:
+                    os.close(descriptor)
+            current = _read_lock_fallback(path)
+            if not _same_lock_state(initial, current):
+                raise CtxError(mismatch_code, message, exit_code=4)
+            if replacement is None:
+                path.unlink(missing_ok=True)
+                action = "removed"
+            else:
+                assert temporary is not None
+                os.replace(temporary, path)
+                temporary = None
+                action = "updated" if initial is not None else "created"
+            written = _read_lock_fallback(path)
+            if replacement is None:
+                if written is not None:
+                    raise CtxError(mismatch_code, message, exit_code=4)
+                return _LockWriteResult(action, b"", initial_content)
+            if (
+                written is None
+                or written.content != replacement
+                or temporary_identity != (written.device, written.inode)
+            ):
+                raise CtxError(mismatch_code, message, exit_code=4)
+            return _LockWriteResult(action, replacement, initial_content)
+        except CtxError:
+            raise
+        except OSError as exc:
+            raise CtxError(
+                "lock.write-failed",
+                f"cannot write freshness lock {path}: {exc}",
+                exit_code=4,
+            ) from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    try:
+        return _replace_lock_bytes_at(
+            directory_fd,
+            path,
+            replacement,
+            expected_previous=expected_previous,
+            mismatch_code=mismatch_code,
+            mismatch_message=message,
+        )
+    except CtxError:
+        raise
+    except OSError as exc:
+        raise CtxError(
+            "lock.write-failed",
+            f"cannot write freshness lock {path}: {exc}",
+            exit_code=4,
+        ) from exc
+    finally:
+        os.close(directory_fd)
+
+
+def _write_lock(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    expected_previous: bytes | None | object = _ANY_LOCK,
+    mismatch_code: str = "lock.concurrent-change",
+    mismatch_message: str | None = None,
+) -> _LockWriteResult:
+    return _replace_lock_bytes(
+        path,
+        _canonical_json(payload),
+        expected_previous=expected_previous,
+        mismatch_code=mismatch_code,
+        mismatch_message=mismatch_message,
+    )
+
+
+def _restore_lock(
+    path: Path,
+    previous: bytes | None,
+    *,
+    expected_current: bytes,
+) -> None:
+    _replace_lock_bytes(
+        path,
+        previous,
+        expected_previous=expected_current,
+        mismatch_code="lock.rollback-failed",
+        mismatch_message=f"freshness lock changed concurrently and was not restored: {path}",
+    )
+
+
+def seal_freshness(
+    path: Path,
+    *,
+    expected_previous: bytes | None | object = _ANY_LOCK,
+    mismatch_code: str = "lock.concurrent-change",
+    mismatch_message: str | None = None,
+) -> LockResult:
     validation = validate_project(path, strict=True)
     if not validation.valid:
         first = (validation.errors or validation.strict_failures)[0]
@@ -510,8 +883,13 @@ def seal_freshness(path: Path) -> LockResult:
         },
     }
     output = lock_path(validation.project_root)
-    previous = output.read_bytes() if output.is_file() and not output.is_symlink() else None
-    action = _write_lock(output, payload)
+    write = _write_lock(
+        output,
+        payload,
+        expected_previous=expected_previous,
+        mismatch_code=mismatch_code,
+        mismatch_message=mismatch_message,
+    )
     try:
         status = project_status(validation.project_root)
         if not status.fresh:
@@ -521,9 +899,13 @@ def seal_freshness(path: Path) -> LockResult:
                 exit_code=4,
             )
     except Exception:
-        _restore_lock(output, previous)
+        _restore_lock(
+            output,
+            write.previous,
+            expected_current=write.content,
+        )
         raise
-    return LockResult(action, output, status)
+    return LockResult(write.action, output, status, write.content)
 
 
 def seal_freshness_subset(
@@ -564,7 +946,7 @@ def seal_freshness_subset(
             "project changed after reconciliation review and before freshness sealing",
             exit_code=4,
         )
-    locked, lock_valid, lock_error = _load_lock(
+    locked, lock_valid, lock_error, locked_content = _load_lock(
         validation.project_root, validation.project.id
     )
     output = lock_path(validation.project_root)
@@ -604,8 +986,15 @@ def seal_freshness_subset(
         "project_id": validation.project.id,
         "nodes": {uri: updated[uri] for uri in sorted(updated)},
     }
-    previous = output.read_bytes() if output.is_file() and not output.is_symlink() else None
-    action = _write_lock(output, payload)
+    write = _write_lock(
+        output,
+        payload,
+        expected_previous=locked_content,
+        mismatch_code="lock.concurrent-change",
+        mismatch_message=(
+            "freshness lock changed after selective reconciliation loaded it"
+        ),
+    )
     try:
         verified_validation = validate_project(validation.project_root, strict=True)
         if not verified_validation.valid:
@@ -625,7 +1014,7 @@ def seal_freshness_subset(
                     "the prior lock was restored",
                     exit_code=4,
                 )
-        reloaded, reloaded_valid, reloaded_error = _load_lock(
+        reloaded, reloaded_valid, reloaded_error, _reloaded_content = _load_lock(
             validation.project_root, validation.project.id
         )
         if not reloaded_valid:
@@ -644,9 +1033,13 @@ def seal_freshness_subset(
                 )
         status = project_status(validation.project_root)
     except Exception:
-        _restore_lock(output, previous)
+        _restore_lock(
+            output,
+            write.previous,
+            expected_current=write.content,
+        )
         raise
-    return LockResult(action, output, status)
+    return LockResult(write.action, output, status, write.content)
 
 
 def initialize_freshness(path: Path) -> LockResult:
@@ -656,32 +1049,68 @@ def initialize_freshness(path: Path) -> LockResult:
     if output.exists() or output.is_symlink():
         status = project_status(validation.project_root)
         if status.fresh:
-            return LockResult("unchanged", output, status)
+            content = read_lock_bytes_no_follow(output)
+            assert content is not None
+            return LockResult("unchanged", output, status, content)
         raise CtxError(
             "lock.reconciliation-required",
             "an existing freshness lock is not fresh; use `ctx reconcile` rather "
             "than retrofit to review and seal the changes",
             exit_code=1,
         )
-    return seal_freshness(path)
+    return seal_freshness(
+        path,
+        expected_previous=None,
+        mismatch_code="lock.concurrent-change",
+        mismatch_message="freshness lock appeared during initialization",
+    )
 
 
 def remove_created_lock(result: LockResult, expected_bytes: bytes) -> None:
     """Best-effort exact rollback used by the retrofit transaction."""
     if result.action != "created":
         return
-    path = result.path
     try:
-        if path.is_symlink() or path.read_bytes() != expected_bytes:
-            raise CtxError(
-                "lock.rollback-failed",
-                f"new lock changed concurrently and was not removed: {path}",
-                exit_code=4,
-            )
-        path.unlink()
+        _replace_lock_bytes(
+            result.path,
+            None,
+            expected_previous=expected_bytes,
+            mismatch_code="lock.rollback-failed",
+            mismatch_message=(
+                "new lock changed concurrently and was not removed: "
+                f"{result.path}"
+            ),
+        )
     except CtxError:
         raise
     except OSError as exc:
         raise CtxError(
-            "lock.rollback-failed", f"cannot roll back new freshness lock {path}: {exc}", exit_code=4
+            "lock.rollback-failed",
+            f"cannot roll back new freshness lock {result.path}: {exc}",
+            exit_code=4,
+        ) from exc
+
+
+def restore_replaced_lock(
+    result: LockResult,
+    expected_bytes: bytes,
+    previous_bytes: bytes,
+) -> None:
+    """Restore an exactly known lock replaced by a guarded transaction."""
+
+    if result.action != "updated":
+        return
+    try:
+        _restore_lock(
+            result.path,
+            previous_bytes,
+            expected_current=expected_bytes,
+        )
+    except CtxError:
+        raise
+    except OSError as exc:
+        raise CtxError(
+            "lock.rollback-failed",
+            f"cannot restore replaced freshness lock {result.path}: {exc}",
+            exit_code=4,
         ) from exc

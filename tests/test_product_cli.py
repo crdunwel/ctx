@@ -43,6 +43,23 @@ class ProductCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return root
 
+    def set_registry_policy(
+        self,
+        project_id: str,
+        *,
+        trust: str = "trusted",
+        reuse_policy: str = "code-allowed",
+    ) -> None:
+        registry_path = self.ctx_home / "registry.json"
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        entry = payload["projects"][project_id]
+        entry["trust"] = trust
+        entry["reuse_policy"] = reuse_policy
+        registry_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     def init_hydration_scope_project(self) -> tuple[Path, Path, Path]:
         root = self.init("scope")
         alpha = root / "alpha"
@@ -178,7 +195,8 @@ items:
         self.assertIn("--apply PLAN_ID", retrofit_help.stdout)
         self.assertIn("--show-plan PLAN_ID", retrofit_help.stdout)
         self.assertIn("--no-hooks", retrofit_help.stdout)
-        self.assertIn("install the project Codex hooks", retrofit_help.stdout)
+        self.assertIn("canonical Codex hooks", retrofit_help.stdout)
+        self.assertIn("reuse an exact user-wide installation", retrofit_help.stdout)
         self.assertIn("model provider", retrofit_help.stdout)
         self.assertIn("not secret-content detection", retrofit_help.stdout)
         self.assertNotIn("default: None", retrofit_help.stdout)
@@ -207,7 +225,12 @@ items:
         payload = json.loads(result.stdout)
         self.assertEqual(payload["schema"], "ctx-doctor/v1")
         self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["codex_hooks"])
         self.assertFalse(self.ctx_home.exists())
+
+        human = self.run_ctx("doctor")
+        self.assertEqual(human.returncode, 0, human.stdout + human.stderr)
+        self.assertIn("Ctx project: none found from .", human.stdout)
 
     def test_direct_node_and_default_show(self) -> None:
         root = self.init("direct-node")
@@ -234,6 +257,113 @@ items:
         self.assertTrue(json.loads(searched.stdout)["results"])
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(json.loads(shown.stdout)["selected_uri"], "ctx://permit-atlas")
+
+    def test_search_reports_match_and_policy_metadata(self) -> None:
+        root = self.init("signal", alias="signal project")
+        feature = root / "feature"
+        feature.mkdir()
+        (feature / ".ctx").mkdir()
+        (feature / ".ctx" / "context.yaml").write_text(
+            """version: 1
+node:
+  id: feature
+  name: Camera permissions
+  summary: Onboarding camera permission behavior.
+""",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_ctx("register", str(root)).returncode, 0)
+        self.set_registry_policy(
+            "signal", trust="untrusted", reuse_policy="reference-only"
+        )
+
+        result = self.run_ctx(
+            "search", "camera permissions", "--project", "signal", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        hit = json.loads(result.stdout)["results"][0]
+        self.assertEqual(hit["uri"], "ctx://signal/feature")
+        self.assertEqual(hit["trust"], "untrusted")
+        self.assertEqual(hit["reuse_policy"], "reference-only")
+        self.assertEqual(hit["match"]["kind"], "title-exact")
+        self.assertEqual(hit["match"]["field"], "node.name")
+        self.assertEqual(hit["match"]["tokens"], ["camera", "permissions"])
+
+        partial = self.run_ctx(
+            "search", "camera migration", "--project", "signal", "--json"
+        )
+        self.assertEqual(partial.returncode, 0, partial.stdout + partial.stderr)
+        partial_hits = json.loads(partial.stdout)["results"]
+        self.assertTrue(partial_hits)
+        self.assertTrue(all(value["score"] < 2_000 for value in partial_hits))
+
+    def test_external_path_include_requires_registered_policy_checked_checkout(self) -> None:
+        local = self.init("local")
+        external = self.init("external")
+        unregistered = self.init("unregistered")
+
+        rejected = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(local),
+            "--include",
+            str(unregistered),
+            "--json",
+        )
+        self.assertEqual(rejected.returncode, 3, rejected.stdout + rejected.stderr)
+        self.assertEqual(
+            json.loads(rejected.stdout)["error"]["code"],
+            "reference.external-path-unregistered",
+        )
+
+        self.assertEqual(self.run_ctx("register", str(external)).returncode, 0)
+        self.set_registry_policy(
+            "external", trust="untrusted", reuse_policy="reference-only"
+        )
+        accepted = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(local),
+            "--include",
+            str(external),
+            "--json",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        external_node = json.loads(accepted.stdout)["nodes"][-1]
+        self.assertEqual(external_node["uri"], "ctx://external")
+        self.assertTrue(external_node["external"])
+        self.assertEqual(external_node["trust"], "untrusted")
+        self.assertEqual(external_node["reuse_policy"], "reference-only")
+
+        self.set_registry_policy("external", reuse_policy="prohibited")
+        (external / ".ctx" / "context.yaml").write_text(
+            "this manifest is deliberately invalid: [\n", encoding="utf-8"
+        )
+        commands = (
+            ("resolve", "external", "--json"),
+            ("graph", "ctx://external", "--json"),
+            ("search", "external", "--project", "external", "--json"),
+            (
+                "hydrate",
+                "--from",
+                str(local),
+                "--include",
+                str(external),
+                "--json",
+            ),
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                denied = self.run_ctx(*command)
+                self.assertEqual(denied.returncode, 3, denied.stdout + denied.stderr)
+                self.assertEqual(
+                    json.loads(denied.stdout)["error"]["code"],
+                    "policy.prohibited",
+                )
+
+        global_search = self.run_ctx("search", "external", "--json")
+        self.assertEqual(global_search.returncode, 0, global_search.stderr)
+        self.assertEqual(json.loads(global_search.stdout)["results"], [])
 
     def test_hydrate_is_local_by_default_and_explicitly_external(self) -> None:
         permit = self.init("permit-atlas", alias="permit atlas")
@@ -312,6 +442,84 @@ artifacts:
         self.assertIn(str(forms / "FormShell.tsx"), result.stdout)
         self.assertNotIn("ctx://permit-atlas/billing", result.stdout)
 
+    def test_task_named_project_expands_only_unique_strong_scope(self) -> None:
+        atlas = self.init("atlas", alias="Permit Atlas")
+        for node_id, name, summary in (
+            ("camera", "Camera permissions", "Camera access and denial behavior."),
+            ("onboarding", "Onboarding", "First-run setup behavior."),
+            ("alpha", "Alpha", "Shared workflow for catalog intake."),
+            ("beta", "Beta", "Shared workflow for inventory intake."),
+        ):
+            directory = atlas / node_id
+            directory.mkdir()
+            (directory / ".ctx").mkdir()
+            (directory / ".ctx" / "context.yaml").write_text(
+                f"""version: 1
+node:
+  id: {node_id}
+  name: {name}
+  summary: {summary}
+""",
+                encoding="utf-8",
+            )
+        consumer = self.init("consumer")
+        self.assertEqual(self.run_ctx("register", str(atlas)).returncode, 0)
+
+        strong = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(consumer),
+            "--task",
+            "Use camera permissions from Permit Atlas",
+            "--json",
+        )
+        self.assertEqual(strong.returncode, 0, strong.stdout + strong.stderr)
+        strong_payload = json.loads(strong.stdout)
+        self.assertEqual(
+            [node["uri"] for node in strong_payload["nodes"]],
+            ["ctx://consumer", "ctx://atlas/camera"],
+        )
+        self.assertEqual(strong_payload["warnings"], [])
+
+        weak = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(consumer),
+            "--task",
+            "Use onboarding camera permissions from Permit Atlas",
+            "--json",
+        )
+        self.assertEqual(weak.returncode, 0, weak.stdout + weak.stderr)
+        weak_payload = json.loads(weak.stdout)
+        self.assertEqual(
+            [node["uri"] for node in weak_payload["nodes"]],
+            ["ctx://consumer", "ctx://atlas"],
+        )
+        self.assertTrue(
+            any(
+                "matched context only weakly" in value
+                for value in weak_payload["warnings"]
+            )
+        )
+
+        ambiguous = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(consumer),
+            "--task",
+            "Use shared workflow from Permit Atlas",
+            "--json",
+        )
+        self.assertEqual(ambiguous.returncode, 0, ambiguous.stdout + ambiguous.stderr)
+        ambiguous_payload = json.loads(ambiguous.stdout)
+        self.assertEqual(
+            [node["uri"] for node in ambiguous_payload["nodes"]],
+            ["ctx://consumer", "ctx://atlas"],
+        )
+        self.assertTrue(
+            any("is ambiguous" in value for value in ambiguous_payload["warnings"])
+        )
+
     def test_hydrate_is_scope_driven_and_keeps_links_as_references(self) -> None:
         root, alpha, _beta = self.init_hydration_scope_project()
 
@@ -366,6 +574,87 @@ artifacts:
         self.assertIn("ctx hydrate --from <file-or-directory> --task <task>", markdown.stdout)
         self.assertNotIn("Root-only authoritative artifact", markdown.stdout)
         self.assertNotIn("Root pattern", markdown.stdout)
+
+    def test_local_task_exact_item_expands_without_waking_siblings(self) -> None:
+        root, _alpha, _beta = self.init_hydration_scope_project()
+        for node_id in ("data", "fix", "test"):
+            directory = root / node_id
+            directory.mkdir()
+            (directory / ".ctx").mkdir()
+            (directory / ".ctx" / "context.yaml").write_text(
+                f"""version: 1
+node:
+  id: {node_id}
+  name: {node_id.title()}
+""",
+                encoding="utf-8",
+            )
+
+        exact = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(root),
+            "--task",
+            "Apply the Beta pattern",
+            "--json",
+        )
+        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
+        exact_payload = json.loads(exact.stdout)
+        self.assertEqual(
+            [node["uri"] for node in exact_payload["nodes"]],
+            ["ctx://scope", "ctx://scope/beta"],
+        )
+        requested = exact_payload["nodes"][-1]
+        self.assertEqual(requested["role"], "requested")
+        self.assertEqual(
+            [item["id"] for item in requested["items"]],
+            ["beta-pattern", "beta-invariant"],
+        )
+        self.assertNotIn(
+            "ctx://scope/alpha", [node["uri"] for node in exact_payload["nodes"]]
+        )
+
+        ordinary = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(root),
+            "--task",
+            "Fix data test behavior",
+            "--json",
+        )
+        self.assertEqual(ordinary.returncode, 0, ordinary.stdout + ordinary.stderr)
+        self.assertEqual(
+            [node["uri"] for node in json.loads(ordinary.stdout)["nodes"]],
+            ["ctx://scope"],
+        )
+
+        peer = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(root / "alpha"),
+            "--task",
+            "Use the Beta scope",
+            "--json",
+        )
+        self.assertEqual(peer.returncode, 0, peer.stdout + peer.stderr)
+        self.assertEqual(
+            [node["uri"] for node in json.loads(peer.stdout)["nodes"]],
+            ["ctx://scope", "ctx://scope/alpha", "ctx://scope/beta"],
+        )
+
+        weak = self.run_ctx(
+            "hydrate",
+            "--from",
+            str(root),
+            "--task",
+            "Work on reusable behavior",
+            "--json",
+        )
+        self.assertEqual(weak.returncode, 0, weak.stdout + weak.stderr)
+        self.assertEqual(
+            [node["uri"] for node in json.loads(weak.stdout)["nodes"]],
+            ["ctx://scope"],
+        )
 
     def test_hydrate_expands_an_exact_explicit_link_target(self) -> None:
         _root, alpha, _beta = self.init_hydration_scope_project()

@@ -8,13 +8,20 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .codex_cli import find_codex_executable
 from .diagnostics import CtxError, UnsafePathError
-from .freshness import LockResult, ProjectStatus, lock_path, project_status, seal_freshness
+from .freshness import (
+    LockResult,
+    ProjectStatus,
+    lock_path,
+    project_status,
+    seal_freshness,
+    source_ownership,
+)
 from .models import LoadedNode
 from .paths import resolved_project_path
 from .retrofit import (
@@ -32,7 +39,9 @@ from .retrofit_agent import (
     MAX_SUMMARY_CHARACTERS,
     _build_filtered_snapshot,
     _fingerprint_eligible_evidence,
+    _is_instruction_inspection_path,
     _manifest_references_inspection_adapter,
+    _materialize_validation_files,
     _materialize_validation_placeholders,
     _open_child_directory_no_follow,
     _open_directory_no_follow,
@@ -43,6 +52,7 @@ from .retrofit_agent import (
     _write_all,
 )
 from .schema import parse_manifest
+from .uri import ContextUri, parse_ctx_uri
 from .validation import ValidationResult, validate_project
 from .yamlio import MAX_MANIFEST_BYTES, load_yaml
 
@@ -191,16 +201,18 @@ def _require_root_identity(
 
 
 def _required_inspection_paths(status: ProjectStatus) -> frozenset[str]:
-    """Keep affected manifests and their declared evidence complete."""
+    """Keep every reviewable manifest and its declared evidence complete."""
 
-    affected_uris = {value.uri for value in _affected(status)}
     required: set[str] = {
         _manifest_relative(status.root, value.manifest)
-        for value in _affected(status)
+        for value in _reviewable(status)
     }
-    for node in status.validation.nodes:
-        if node.uri not in affected_uris:
-            continue
+    for status_node in _reviewable(status):
+        node = next(
+            value
+            for value in status.validation.nodes
+            if value.uri == status_node.uri
+        )
         for artifact in node.manifest.artifacts:
             resolved = resolved_project_path(
                 node.document.node_dir,
@@ -210,6 +222,91 @@ def _required_inspection_paths(status: ProjectStatus) -> frozenset[str]:
             )
             required.add(resolved.relative_to(status.root).as_posix())
     return frozenset(required)
+
+
+def _scoped_mandatory_paths(
+    status: ProjectStatus,
+    inventory: RetrofitInventory,
+) -> frozenset[str]:
+    """Keep reviewable manifests and only governing instruction files mandatory."""
+
+    reviewable = _reviewable(status)
+    mandatory = {
+        _manifest_relative(status.root, value.manifest) for value in reviewable
+    }
+    affected_directories = tuple(
+        value.manifest.parent.parent.relative_to(status.root)
+        for value in _affected(status)
+    )
+    for relative in inventory.eligible_files:
+        if not _is_instruction_inspection_path(relative):
+            continue
+        parent = PurePosixPath(relative).parent
+        instruction_directory = Path(parent.as_posix())
+        if str(parent) == "." or any(
+            instruction_directory == directory
+            or directory.is_relative_to(instruction_directory)
+            for directory in affected_directories
+        ):
+            mandatory.add(relative)
+    return frozenset(mandatory)
+
+
+def _scoped_inspection_paths(
+    status: ProjectStatus,
+    inventory: RetrofitInventory,
+) -> frozenset[str]:
+    """Select affected-node source while whole-project evidence stays hashed."""
+
+    affected_uris = {value.uri for value in _affected(status)}
+    ownership = source_ownership(status.validation, inventory=inventory)
+    selected = {
+        path
+        for uri in affected_uris
+        for path in ownership.get(uri, frozenset())
+    }
+    selected.update(_required_inspection_paths(status))
+    selected.update(_linked_inspection_paths(status))
+    return frozenset(selected)
+
+
+def _linked_inspection_paths(status: ProjectStatus) -> frozenset[str]:
+    """Route bounded declared peer evidence into an affected-scope review."""
+
+    affected_uris = {value.uri for value in _affected(status)}
+    loaded_by_uri = {value.uri: value for value in status.validation.nodes}
+    related_uris: set[str] = set()
+    for node in status.validation.nodes:
+        for link in node.manifest.links:
+            try:
+                parsed = parse_ctx_uri(link.target)
+            except CtxError:
+                continue
+            if parsed.project_id != status.project_id:
+                continue
+            target_uri = str(ContextUri(parsed.project_id, parsed.node_ids))
+            if node.uri in affected_uris:
+                related_uris.add(target_uri)
+            if target_uri in affected_uris:
+                related_uris.add(node.uri)
+    related_uris.difference_update(affected_uris)
+    selected: set[str] = set()
+    for uri in sorted(related_uris)[:16]:
+        node = loaded_by_uri.get(uri)
+        if node is None:
+            continue
+        selected.add(_manifest_relative(status.root, node.document.path))
+        for artifact in node.manifest.artifacts:
+            resolved = resolved_project_path(
+                node.document.node_dir,
+                artifact.path,
+                status.root,
+                require_exists=True,
+            )
+            selected.add(resolved.relative_to(status.root).as_posix())
+            if len(selected) >= 256:
+                return frozenset(selected)
+    return frozenset(selected)
 
 
 def _evidence_sections(root: Path, node: LoadedNode) -> dict[str, Any]:
@@ -1091,7 +1188,7 @@ def _seal_unchanged(
             expected_root_identity=expected_root_identity,
         )
         raise
-    return LockResult(sealed.action, sealed.path, verified)
+    return LockResult(sealed.action, sealed.path, verified, sealed.content)
 
 
 def reconcile_project(
@@ -1218,11 +1315,14 @@ def reconcile_project(
             manifest_guards = _capture_manifest_guards(
                 root_fd, reviewable_manifest_paths
             )
+            required_inspection_paths = _required_inspection_paths(before)
             inspection = _build_filtered_snapshot(
                 inventory,
                 root_fd,
                 snapshot,
-                required_paths=_required_inspection_paths(before),
+                inspection_paths=_scoped_inspection_paths(before, inventory),
+                mandatory_paths=_scoped_mandatory_paths(before, inventory),
+                required_paths=required_inspection_paths,
                 manual_command="ctx reconcile --prompt",
             )
             result_path = _run_codex(
@@ -1236,7 +1336,23 @@ def reconcile_project(
             proposals, parsed_acknowledgements = _prepare(
                 before, manifests, acknowledgements, work
             )
-            _materialize_validation_placeholders(snapshot, inspection)
+            validation_files = frozenset(inventory.all_context_manifests) - frozenset(
+                inspection.copied_paths
+            )
+            _materialize_validation_files(
+                root_fd,
+                snapshot,
+                validation_files,
+            )
+            validation_inspection = replace(
+                inspection,
+                elided_paths=tuple(
+                    path
+                    for path in inspection.elided_paths
+                    if path not in validation_files
+                ),
+            )
+            _materialize_validation_placeholders(snapshot, validation_inspection)
             snapshot_validation = _validate_snapshot(snapshot, proposals)
             if not snapshot_validation.valid:
                 return ReconcileResult(

@@ -301,6 +301,22 @@ class CodexHookLifecycleTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("created Codex hooks", first.stdout)
         self.assertIn("unchanged Codex hooks", second.stdout)
+        self.assertIn("Codex CLI/TUI: run /hooks", first.stdout)
+        self.assertIn("Codex desktop: /hooks is not available", first.stdout)
+        user = self.run_ctx("integrate", "codex", "--hooks", "--user")
+        self.assertEqual(user.returncode, 0, user.stdout + user.stderr)
+        self.assertIn("review and trust the user-wide hooks", user.stdout)
+        self.assertIn("explicit ctx hydrate works immediately", user.stdout)
+        diagnosed = self.run_ctx("doctor", str(self.project), "--json")
+        self.assertEqual(diagnosed.returncode, 0, diagnosed.stdout + diagnosed.stderr)
+        diagnosis = json.loads(diagnosed.stdout)["codex_hooks"]
+        self.assertEqual(diagnosis["hooks"]["project"]["status"], "canonical")
+        self.assertEqual(diagnosis["hooks"]["user"]["status"], "canonical")
+        self.assertTrue(diagnosis["possible_duplicate_execution"])
+        human = self.run_ctx("doctor", str(self.project))
+        self.assertEqual(human.returncode, 0, human.stdout + human.stderr)
+        self.assertIn("WARNING: canonical ctx hooks exist", human.stdout)
+        self.assertIn("Hook trust: not inspectable by ctx", human.stdout)
         hooks = json.loads((self.project / ".codex" / "hooks.json").read_text())
         self.assertEqual(
             hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],

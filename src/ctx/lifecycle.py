@@ -4,10 +4,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .freshness import LockResult, initialize_freshness, remove_created_lock
+from .freshness import (
+    LockResult,
+    initialize_freshness,
+    remove_created_lock,
+    restore_replaced_lock,
+    seal_freshness,
+)
 from .integration import (
     CodexHooksInstallResult,
-    install_codex_hooks,
+    ensure_codex_hooks_for_retrofit,
     remove_created_codex_hooks,
 )
 from .registry import RegistrationResult, register_project, rollback_registration
@@ -25,25 +31,40 @@ def complete_retrofit(
     *,
     enable_codex_hooks: bool = True,
     verify_unchanged: Callable[[], None] | None = None,
+    replace_fresh_lock: bytes | None = None,
 ) -> RetrofitLifecycleResult:
     """Enable a retrofitted project for discovery, freshness, and Codex use.
 
-    Project hooks and the initial lock are create-only repository state. All
-    lifecycle writes are rolled back when later work or an optional evidence
-    guard fails. The guard brackets freshness sealing and registration.
+    Hook setup is create-only and reuses canonical user-wide hooks instead of
+    duplicating them at project scope. A reviewed fresh lock may be
+    conditionally replaced when missing manifests are added. All lifecycle
+    writes are rolled back when later work or an optional evidence guard fails.
+    The guard brackets freshness sealing and registration.
     """
 
     hooks: CodexHooksInstallResult | None = None
     lock: LockResult | None = None
     registration: RegistrationResult | None = None
     expected_lock: bytes | None = None
+    previous_lock: bytes | None = None
     try:
         if enable_codex_hooks:
-            hooks = install_codex_hooks(project=root)
+            hooks = ensure_codex_hooks_for_retrofit(root)
         if verify_unchanged is not None:
             verify_unchanged()
-        lock = initialize_freshness(root)
-        expected_lock = lock.path.read_bytes()
+        if replace_fresh_lock is None:
+            lock = initialize_freshness(root)
+        else:
+            previous_lock = replace_fresh_lock
+            lock = seal_freshness(
+                root,
+                expected_previous=replace_fresh_lock,
+                mismatch_code="lock.review-baseline-changed",
+                mismatch_message="freshness lock changed after the reviewed baseline",
+            )
+        expected_lock = lock.content
+        if expected_lock is None:  # pragma: no cover - internal result contract
+            raise AssertionError("freshness operation did not return exact lock bytes")
         if verify_unchanged is not None:
             verify_unchanged()
         registration = register_project(root)
@@ -58,7 +79,10 @@ def complete_retrofit(
                 rollback_error = exc
         if lock is not None and expected_lock is not None:
             try:
-                remove_created_lock(lock, expected_lock)
+                if previous_lock is None:
+                    remove_created_lock(lock, expected_lock)
+                else:
+                    restore_replaced_lock(lock, expected_lock, previous_lock)
             except Exception as exc:  # pragma: no cover - defensive rollback boundary
                 rollback_error = rollback_error or exc
         if hooks is not None:

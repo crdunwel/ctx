@@ -8,12 +8,19 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
-from .diagnostics import CtxError, NotFoundError, UnsafePathError
+from .diagnostics import CtxError, NotFoundError
 from .discovery import Ancestry, discover_ancestry
 from .freshness import project_status
 from .models import Artifact, Item, LoadedNode
 from .registry import load_registry
-from .universe import ResolvedContext, resolve_reference, search_context
+from .universe import (
+    IndexedProject,
+    ResolvedContext,
+    indexed_project_for_path,
+    require_context_reuse,
+    resolve_reference,
+    search_context,
+)
 from .uri import ContextUri, parse_ctx_uri
 from .validation import ValidationResult, validate_project
 
@@ -501,10 +508,7 @@ def _bounded_dormant_scopes(
 
 def _external_node(resolved: ResolvedContext) -> HydratedNode:
     entry = resolved.project.entry
-    if entry.reuse_policy == "prohibited":
-        raise UnsafePathError(
-            "policy.prohibited", f"registered project {entry.project_id} prohibits context reuse"
-        )
+    require_context_reuse(entry)
     return HydratedNode(
         resolved.node,
         resolved.project.validation.project_root,
@@ -525,15 +529,18 @@ def _task_context_references(task: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(CTX_URI_IN_TEXT.findall(task)))
 
 
-def _task_project_references(task: str | None, local_project_id: str) -> tuple[str, ...]:
+def _task_project_references(
+    task: str | None, local_project_id: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not task:
-        return ()
+        return (), ()
     explicitly_referenced_projects = {
         parse_ctx_uri(reference).project_id
         for reference in _task_context_references(task)
     }
     haystack = " ".join(re.findall(r"[\w-]+", task.casefold()))
     found: list[str] = []
+    warnings: list[str] = []
     task_tokens = re.findall(r"[a-z0-9]+", task.casefold())
     stop_words = {
         "a",
@@ -570,14 +577,159 @@ def _task_project_references(task: str | None, local_project_id: str) -> tuple[s
                     for token in task_tokens
                     if token not in identity_tokens and token not in stop_words
                 ]
+                requested_kinds = {
+                    token
+                    for token in terms
+                    if token in {"pattern", "invariant", "decision"}
+                }
+                if requested_kinds:
+                    terms = [token for token in terms if token not in requested_kinds]
                 query = " ".join(terms)
                 hits = search_context(query, project=entry.project_id) if query else ()
-                if hits and hits[0].score:
-                    found.append(hits[0].uri)
-                else:
+                if requested_kinds:
+                    hits = tuple(hit for hit in hits if hit.kind in requested_kinds)
+                if not hits:
                     found.append(entry.project_id)
+                    if query:
+                        warnings.append(
+                            f"Task named project {entry.project_id}, but {query!r} did not "
+                            "identify a context scope; expanded the project root only."
+                        )
+                    break
+
+                top_score = hits[0].score
+                leaders = tuple(hit for hit in hits if hit.score == top_score)
+                strong = top_score >= 2_000
+                if not strong:
+                    found.append(entry.project_id)
+                    warnings.append(
+                        f"Task named project {entry.project_id}, but {query!r} matched "
+                        "context only weakly; expanded the project root only."
+                    )
+                elif len({hit.uri for hit in leaders}) != 1:
+                    candidates = ", ".join(hit.uri for hit in leaders[:4])
+                    found.append(entry.project_id)
+                    warnings.append(
+                        f"Task context in project {entry.project_id} is ambiguous for "
+                        f"{query!r}: {candidates}; expanded the project root only."
+                    )
+                else:
+                    found.append(leaders[0].uri)
                 break
-    return tuple(dict.fromkeys(found))
+    return tuple(dict.fromkeys(found)), tuple(dict.fromkeys(warnings))
+
+
+def _task_local_references(
+    task: str | None,
+    validation: ValidationResult,
+    active: LoadedNode,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Resolve explicit identities only on the active child/peer routing frontier."""
+
+    if not task or _task_context_references(task):
+        return (), ()
+    haystack = " ".join(re.findall(r"[a-z0-9]+", task.casefold()))
+    task_tokens = set(haystack.split())
+    active_ids = parse_ctx_uri(active.uri).node_ids
+    candidates: dict[str, set[tuple[str, str | None]]] = {}
+    for node in validation.nodes:
+        node_ids = parse_ctx_uri(node.uri).node_ids
+        on_frontier = (
+            node.uri == active.uri
+            or (
+                len(node_ids) == len(active_ids) + 1
+                and node_ids[:-1] == active_ids
+            )
+            or (
+                bool(active_ids)
+                and len(node_ids) == len(active_ids)
+                and node_ids[:-1] == active_ids[:-1]
+            )
+        )
+        if not on_frontier:
+            continue
+        for value in (node.manifest.node.id, node.manifest.node.name):
+            normalized = " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+            if normalized:
+                candidates.setdefault(normalized, set()).add((node.uri, None))
+        for item in node.manifest.items:
+            reference = f"{node.uri}#{item.id}"
+            for value in (item.id, item.title):
+                normalized = " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+                if normalized:
+                    candidates.setdefault(normalized, set()).add(
+                        (reference, item.kind)
+                    )
+
+    def explicit(phrase: str, matches: set[tuple[str, str | None]]) -> bool:
+        if len(phrase.split()) >= 2:
+            return True
+        if any(kind in task_tokens for _reference, kind in matches if kind):
+            return True
+        cue = r"(?:scope|node|module|component|area|from|in|within)"
+        return bool(
+            re.search(
+                rf"(?:{cue})\s+(?:the\s+)?{re.escape(phrase)}(?:\s|$)",
+                haystack,
+            )
+            or re.search(
+                rf"(?:^|\s){re.escape(phrase)}\s+(?:scope|node|module|component|area)(?:\s|$)",
+                haystack,
+            )
+        )
+
+    matched_phrases = [
+        phrase
+        for phrase in candidates
+        if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", haystack)
+        and explicit(phrase, candidates[phrase])
+    ]
+    selected_phrases: list[str] = []
+    for phrase in sorted(matched_phrases, key=lambda value: (-len(value.split()), value)):
+        padded = f" {phrase} "
+        if any(padded in f" {selected} " for selected in selected_phrases):
+            continue
+        selected_phrases.append(phrase)
+
+    references: list[str] = []
+    warnings: list[str] = []
+    for phrase in selected_phrases:
+        matches = sorted(reference for reference, _kind in candidates[phrase])
+        unique_matches = tuple(dict.fromkeys(matches))
+        if len(unique_matches) == 1:
+            references.append(unique_matches[0])
+        else:
+            warnings.append(
+                f"Local task context is ambiguous for {phrase!r}: "
+                f"{', '.join(unique_matches[:4])}; kept those scopes dormant."
+            )
+    return tuple(dict.fromkeys(references)), tuple(dict.fromkeys(warnings))
+
+
+def _external_path_nodes(
+    ancestry: Ancestry,
+    indexed: IndexedProject,
+) -> list[HydratedNode]:
+    _verify_ancestry_snapshot(ancestry, indexed.validation)
+    loaded_by_uri = {node.uri: node for node in indexed.validation.nodes}
+    last_index = len(ancestry.nodes) - 1
+    nodes: list[HydratedNode] = []
+    for index, discovered in enumerate(ancestry.nodes):
+        loaded = loaded_by_uri[discovered.uri]
+        nodes.append(
+            HydratedNode(
+                loaded,
+                indexed.validation.project_root,
+                indexed.entry.project_id,
+                indexed.entry.name,
+                True,
+                indexed.entry.trust,
+                indexed.entry.reuse_policy,
+                detail="expanded" if index == last_index else "ancestor",
+                role="requested" if index == last_index else "ancestor",
+            )
+        )
+    return nodes
 
 
 def _append_unique(nodes: list[HydratedNode], candidate: HydratedNode) -> None:
@@ -713,12 +865,37 @@ def hydrate(
     if reference is not None:
         explicit.insert(0, reference)
     explicit.extend(_task_context_references(task))
-    explicit.extend(_task_project_references(task, ancestry.project.id))
+    task_references, task_warnings = _task_project_references(
+        task, ancestry.project.id
+    )
+    if not task_references:
+        local_task_references, local_task_warnings = _task_local_references(
+            task, local_validation, ancestry.current
+        )
+        task_references = local_task_references
+        task_warnings = (*task_warnings, *local_task_warnings)
+    explicit.extend(task_references)
+    warnings.extend(task_warnings)
     for selected in dict.fromkeys(explicit):
         path_candidate = Path(selected)
         if path_candidate.exists() and not selected.startswith("ctx://"):
-            selected_ancestry = discover_ancestry(path_candidate)
-            for node in _local_nodes(selected_ancestry, explicit=True):
+            try:
+                resolved_path = path_candidate.resolve(strict=True)
+                local_root = ancestry.project_root.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise CtxError(
+                    "hydrate.path-changed",
+                    f"selected context path changed during hydration: {selected}",
+                    exit_code=4,
+                ) from exc
+            if resolved_path == local_root or resolved_path.is_relative_to(local_root):
+                selected_ancestry = discover_ancestry(resolved_path)
+                selected_nodes = _local_nodes(selected_ancestry, explicit=True)
+            else:
+                indexed = indexed_project_for_path(resolved_path)
+                selected_ancestry = discover_ancestry(resolved_path)
+                selected_nodes = _external_path_nodes(selected_ancestry, indexed)
+            for node in selected_nodes:
                 _append_unique(nodes, node)
             continue
         candidate = _local_reference(selected, local_validation=local_validation)

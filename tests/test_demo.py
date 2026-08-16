@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from ctx.diagnostics import CtxError
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-PYTHON = REPOSITORY / ".venv" / "bin" / "python"
+PYTHON = Path(sys.executable)
 
 
 class DemoCommandTests(unittest.TestCase):
@@ -52,7 +53,9 @@ class DemoCommandTests(unittest.TestCase):
         root = self.base.resolve() / "ctx-permit-board-demo"
         self.assertIn(f"DEMO READY {root}", created.stdout)
         self.assertIn("Ask Codex:", created.stdout)
-        self.assertIn("run /hooks", created.stdout)
+        self.assertIn("Codex CLI/TUI: run /hooks", created.stdout)
+        self.assertIn("Codex desktop: /hooks is not available", created.stdout)
+        self.assertIn("ctx hydrate --from . --task", created.stdout)
         self.assertTrue((root / ".ctx" / "context.yaml").is_file())
         self.assertTrue((root / ".ctx" / "lock.json").is_file())
         self.assertTrue((root / ".codex" / "hooks.json").is_file())

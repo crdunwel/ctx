@@ -7,7 +7,7 @@ import re
 import stat
 import sys
 import warnings
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -114,9 +114,24 @@ SECRET_INVENTORY_NAMES = {
 
 INSTRUCTION_NAMES = {
     ".cursorrules",
+    "agent.md",
     "agents.md",
     "claude.md",
     "gemini.md",
+}
+
+ROOT_MARKER_DIRECTORY_SUFFIXES = (
+    ".xcodeproj",
+    ".xcworkspace",
+)
+
+TEST_AREA_NAMES = {
+    "fixture",
+    "fixtures",
+    "spec",
+    "specs",
+    "test",
+    "tests",
 }
 
 ROOT_MARKER_NAMES = {
@@ -452,8 +467,118 @@ def _is_root_marker(path: PurePosixPath) -> bool:
         or name.startswith("contributing.")
         or name == "development.md"
         or name.endswith(".sln")
-        or name.endswith(".xcodeproj")
+        or name.endswith(ROOT_MARKER_DIRECTORY_SUFFIXES)
     )
+
+
+def _is_directory_bundle_root_marker(path: PurePosixPath) -> bool:
+    return len(path.parts) == 1 and path.name.casefold().endswith(
+        ROOT_MARKER_DIRECTORY_SUFFIXES
+    )
+
+
+def _looks_like_test_name(name: str) -> bool:
+    lowered = name.casefold()
+    if lowered in TEST_AREA_NAMES:
+        return True
+    if lowered.endswith(
+        (
+            "-fixture",
+            "-fixtures",
+            "-spec",
+            "-specs",
+            "-test",
+            "-tests",
+            "_fixture",
+            "_fixtures",
+            "_spec",
+            "_specs",
+            "_test",
+            "_tests",
+        )
+    ):
+        return True
+    return name.endswith(
+        ("Fixture", "Fixtures", "Spec", "Specs", "Test", "Tests")
+    )
+
+
+def _is_test_path(path: PurePosixPath) -> bool:
+    return any(_looks_like_test_name(part) for part in path.parts[:-1]) or (
+        _looks_like_test_name(path.stem)
+    )
+
+
+def _hierarchical_area_paths(path: PurePosixPath) -> tuple[str, ...]:
+    """Return bounded structural area hints without inferring semantic nodes."""
+
+    directories = path.parts[:-1]
+    if not directories:
+        return ()
+    areas = [directories[0]]
+    if len(directories) >= 2 and not directories[0].casefold().endswith(
+        ROOT_MARKER_DIRECTORY_SUFFIXES
+    ):
+        areas.append(PurePosixPath(*directories[:2]).as_posix())
+    return tuple(areas)
+
+
+def _representative_area(path: PurePosixPath) -> str:
+    areas = _hierarchical_area_paths(path)
+    return areas[-1] if areas else "."
+
+
+def _representative_priority(path: PurePosixPath) -> int:
+    name = path.name.casefold()
+    if name.startswith(("app.", "client.", "index.", "main.", "server.")):
+        return 0
+    if any(
+        marker in name
+        for marker in ("api", "config", "contract", "migration", "route", "schema")
+    ) or path.suffix.casefold() in {".proto", ".toml"}:
+        return 1
+    if _is_test_path(path):
+        return 2
+    if len(path.parts) <= 2:
+        return 3
+    return 4
+
+
+def _balanced_representative_files(
+    candidates: Iterable[str], *, limit: int
+) -> tuple[str, ...]:
+    """Round-robin salient files across bounded hierarchical areas."""
+
+    pending: dict[str, list[str]] = {}
+    for relative_text in candidates:
+        relative = PurePosixPath(relative_text)
+        pending.setdefault(_representative_area(relative), []).append(relative_text)
+    buckets: dict[str, deque[str]] = {}
+    for area, values in pending.items():
+        values.sort(
+            key=lambda value: (
+                _representative_priority(PurePosixPath(value)),
+                len(PurePosixPath(value).parts),
+                value,
+            )
+        )
+        buckets[area] = deque(values)
+    selected: list[str] = []
+    active = sorted(buckets)
+    while active and len(selected) < limit:
+        next_active: list[str] = []
+        for area in active:
+            values = buckets[area]
+            selected.append(values.popleft())
+            if len(selected) >= limit:
+                break
+            if values:
+                next_active.append(area)
+        else:
+            active = next_active
+            continue
+        break
+    return tuple(selected)
 
 
 def _language_for(path: PurePosixPath) -> str | None:
@@ -886,7 +1011,7 @@ def inventory_repository(path: Path) -> RetrofitInventory:
     manifests: set[str] = set()
     all_manifests: set[str] = set()
     eligible_files: list[str] = []
-    source_candidates: list[tuple[int, str]] = []
+    source_candidates: list[str] = []
     truncated = False
     partial_reasons: set[str] = set()
     rules_read = 0
@@ -1201,6 +1326,13 @@ def inventory_repository(path: Path) -> RetrofitInventory:
                 counters["ignored"] += 1
                 continue
             if is_directory:
+                if _is_directory_bundle_root_marker(relative):
+                    _record_bounded_path(
+                        root_markers,
+                        relative_text,
+                        counters,
+                        "root_markers_total",
+                    )
                 child_directories.append((entry_path, inherited_for_children))
                 continue
             if not is_file:
@@ -1231,17 +1363,24 @@ def inventory_repository(path: Path) -> RetrofitInventory:
             if language is not None:
                 languages[language] += 1
                 if len(relative_text) <= MAX_LISTED_PATH_CHARACTERS:
-                    source_candidates.append((len(relative.parts), relative_text))
+                    source_candidates.append(relative_text)
                 else:
                     counters["paths_omitted"] += 1
-            if len(relative.parts) > 1:
-                areas[relative.parts[0]] += 1
+            for area in _hierarchical_area_paths(relative):
+                areas[area] += 1
         if not stop_scan:
             stack.extend(reversed(child_directories))
         if directory_fd is not None:
             os.close(directory_fd)
 
-    sorted_areas = sorted(areas.items(), key=lambda value: (-value[1], value[0]))
+    sorted_areas = sorted(
+        areas.items(),
+        key=lambda value: (
+            1 if "/" in value[0] else 0,
+            -value[1],
+            value[0],
+        ),
+    )
     if len(sorted_areas) > MAX_LISTED_PATHS or any(
         len(name) > MAX_LISTED_PATH_CHARACTERS for name, _count in sorted_areas
     ):
@@ -1252,11 +1391,18 @@ def inventory_repository(path: Path) -> RetrofitInventory:
         for name, count in sorted_areas
         if len(name) <= MAX_LISTED_PATH_CHARACTERS
     )[:MAX_LISTED_PATHS]
-    representative = set(root_markers)
+    eligible_file_set = set(eligible_files)
+    representative = set(root_markers).intersection(eligible_file_set)
     representative.update(instructions)
-    for _depth, relative_text in sorted(source_candidates):
-        if len(representative) >= MAX_LISTED_PATHS:
-            break
+    remaining_representatives = max(0, MAX_LISTED_PATHS - len(representative))
+    for relative_text in _balanced_representative_files(
+        (
+            relative_text
+            for relative_text in source_candidates
+            if relative_text not in representative
+        ),
+        limit=remaining_representatives,
+    ):
         representative.add(relative_text)
     if counters["unreadable"]:
         truncated = True
@@ -1433,7 +1579,7 @@ path:
 Inventory notes:
 - {existing_note}
 - {truncation_note}
-- The inventory contains names and counts, not source contents or semantic conclusions.
+- The inventory contains names and counts, not source contents or semantic conclusions. Hierarchical area paths are structural inspection hints, not proposed ctx nodes.
 
 ## Version 1 manifest shape
 

@@ -25,7 +25,7 @@ from .demo import create_demo
 from .freshness import project_status
 from .graph import context_graph
 from .hydration import DEFAULT_BUDGET, hydrate
-from .integration import install_codex_hooks
+from .integration import diagnose_codex_hooks, install_codex_hooks
 from .lifecycle import RetrofitLifecycleResult, complete_retrofit
 from .registry import (
     load_registry,
@@ -257,10 +257,17 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
         "doctor",
         help="check the local ctx environment",
         description=(
-            "Inspect Python, PyYAML, registry, and guarded Codex adapter "
-            "availability without changing anything. Codex discovery checks "
-            "CTX_CODEX, PATH, then the standard macOS ChatGPT app bundle."
+            "Inspect Python, PyYAML, registry, guarded Codex adapter availability, "
+            "and project/user hook configuration without changing anything. Codex "
+            "discovery checks CTX_CODEX, PATH, then the standard macOS ChatGPT app "
+            "bundle; hook trust itself is not inspectable."
         ),
+    )
+    doctor.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="path from which to diagnose project and user Codex hooks",
     )
     doctor.add_argument("--json", action="store_true", help="emit one machine-readable JSON document")
 
@@ -326,17 +333,20 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
         description=(
             "Inspect a project with the local Codex CLI and construct only "
             "missing, strict-valid .ctx/context.yaml files, then install the "
-            "project Codex hooks, initialize freshness, and register it. Eligible "
+            "canonical Codex hooks (or reuse an exact user-wide installation), "
+            "initialize freshness, and register it. Eligible "
             "source is fully fingerprinted while a deterministic bounded selection "
             "may be processed by the configured model provider."
         ),
         epilog=(
             "Use `ctx retrofit --prompt [PATH]` (or compatibility form "
             "`ctx retrofit prompt [PATH]`) to print the standalone prompt without starting an agent. "
+            "Use `ctx retrofit review [PATH]` to inspect a fresh existing graph and save a "
+            "reviewable proposal for missing semantic nodes. "
             "A successful --dry-run prints --show-plan and --apply commands for that exact proposal. "
             "Path filtering is not secret-content detection: exclude sensitive files and inspect "
             "the plan and .ctx diff before committing. Large media and data may be sampled, "
-            "previewed, or cataloged without weakening freshness. Use --no-hooks only when Codex project "
+            "previewed, or cataloged without weakening freshness. Use --no-hooks only when Codex "
             "integration is intentionally unwanted."
         ),
     )
@@ -372,9 +382,17 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
     )
     retrofit.add_argument("--agent", default="codex", help="configured local agent adapter")
     retrofit.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "review semantic coverage even when existing context is fresh; "
+            "requires --dry-run and may propose only missing manifests"
+        ),
+    )
+    retrofit.add_argument(
         "--no-hooks",
         action="store_true",
-        help="do not install the project Codex hydration/reconciliation hooks",
+        help="do not enable Codex hydration/reconciliation hooks",
     )
 
     hook = _command_parser(
@@ -459,9 +477,29 @@ def _retrofit_hooks_summary(result: RetrofitLifecycleResult) -> str:
     if hooks is None:
         return "hooks skipped"
     summary = f"hooks {hooks.action} at {_safe_display(hooks.path)}"
-    if hooks.action == "created":
-        summary += " (open /hooks in Codex, then review and trust this configuration)"
+    if hooks.scope == "user":
+        summary += (
+            " (user-wide; no duplicate project hook created; "
+            "Codex CLI/TUI trust is managed in /hooks)"
+        )
+    elif hooks.action == "created":
+        summary += " (Codex CLI/TUI: run /hooks, then review and trust it)"
     return summary
+
+
+def _retrofit_progress(message: str) -> None:
+    print(f"ctx retrofit: {_safe_display(message)}", file=sys.stderr, flush=True)
+
+
+def _print_retrofit_next_steps(root: Path) -> None:
+    quoted_root = shlex.quote(str(root))
+    task = shlex.quote("Map this project and route me to its main semantic scopes")
+    print("Try the context now (read-only):")
+    print(f"  ctx status {quoted_root} --check")
+    print(f"  ctx doctor {quoted_root}")
+    print(f"  ctx hydrate --from {quoted_root} --task {task}")
+    print("Re-audit a fresh graph for missing scopes (project files stay unchanged):")
+    print(f"  ctx retrofit review {quoted_root}")
 
 
 def _render_diagnostic(diagnostic: Diagnostic) -> str:
@@ -634,7 +672,11 @@ def _execute(args: argparse.Namespace) -> int:
         print(f"DEMO READY {result.root}")
         print(f"  Context: {len(result.manifests)} semantic node(s); fresh lock at {result.lock}")
         print(f"  Codex hooks: {result.hooks}")
-        print("  In Codex, run /hooks and review and trust the two project hooks before using them.")
+        print("  Codex CLI/TUI: run /hooks and review and trust the two project hooks.")
+        print(
+            "  Codex desktop: /hooks is not available; run "
+            'ctx hydrate --from . --task "Map this project" immediately.'
+        )
         print("Next:")
         print(f"  cd {quoted_root}")
         print("  codex")
@@ -738,6 +780,11 @@ def _execute(args: argparse.Namespace) -> int:
                 print(f"{hit.uri} — [{hit.kind}] {_safe_display(hit.title)}")
                 if hit.summary:
                     print(f"  {_safe_display(hit.summary)}")
+                matched = ", ".join(hit.matched_tokens) or "none"
+                print(
+                    f"  match={hit.match_kind} field={hit.matched_field} "
+                    f"tokens={matched}; trust={hit.trust}; reuse={hit.reuse_policy}"
+                )
         return 0
     if args.command == "graph":
         result = context_graph(
@@ -817,6 +864,10 @@ def _execute(args: argparse.Namespace) -> int:
             from .registry import registry_path
 
             registry_location = registry_path()
+        try:
+            hook_diagnosis = diagnose_codex_hooks(Path(args.path))
+        except NotFoundError:
+            hook_diagnosis = None
         payload = {
             "schema": "ctx-doctor/v1",
             "ok": yaml_version is not None,
@@ -830,6 +881,9 @@ def _execute(args: argparse.Namespace) -> int:
                 "state": registry_state,
                 "projects": project_count,
             },
+            "codex_hooks": (
+                None if hook_diagnosis is None else hook_diagnosis.to_dict()
+            ),
         }
         if args.json:
             _write_json(payload)
@@ -842,6 +896,26 @@ def _execute(args: argparse.Namespace) -> int:
                 adapter += f" ({codex_source})"
             print(f"Codex adapter: {adapter}")
             print(f"Registry: {registry_location} — {registry_state}; {project_count} project(s)")
+            if hook_diagnosis is None:
+                print(f"Ctx project: none found from {_safe_display(args.path)}")
+            else:
+                print(f"Ctx project: {hook_diagnosis.project_root}")
+                print(
+                    "Codex project hooks: "
+                    f"{hook_diagnosis.project.status} at {hook_diagnosis.project.path}"
+                )
+                print(
+                    "Codex user hooks: "
+                    f"{hook_diagnosis.user.status} at {hook_diagnosis.user.path}"
+                )
+                if hook_diagnosis.possible_duplicate_execution:
+                    print(
+                        "WARNING: canonical ctx hooks exist at both project and user "
+                        "scope; Codex may run both. Keep one scope."
+                    )
+                print("Hook trust: not inspectable by ctx")
+                for recommendation in hook_diagnosis.recommendations:
+                    print(f"  Next: {_safe_display(recommendation)}")
         return 0 if payload["ok"] else 4
     if args.command == "reconcile":
         if args.inspect is not None or args.acknowledge_node is not None or args.complete_run:
@@ -928,6 +1002,12 @@ def _execute(args: argparse.Namespace) -> int:
         retrofit_plan = getattr(args, "apply", None)
         shown_plan = getattr(args, "show_plan", None)
         target = Path(retrofit_path or ".")
+        if args.review and not args.dry_run:
+            raise CtxError(
+                "cli.invalid",
+                "--review requires --dry-run so semantic coverage proposals are reviewed before application",
+                exit_code=1,
+            )
         finalize_retrofit = partial(
             complete_retrofit,
             enable_codex_hooks=not args.no_hooks,
@@ -970,17 +1050,19 @@ def _execute(args: argparse.Namespace) -> int:
             )
             if result.agent_summary.strip():
                 print(f"Agent summary: {_safe_display(result.agent_summary)}")
+            _print_retrofit_next_steps(result.root)
             return 0
         try:
             existing_status = project_status(target)
         except NotFoundError:
             existing_status = None
-        if existing_status is not None and existing_status.fresh:
+        if existing_status is not None and existing_status.fresh and not args.review:
             if args.dry_run:
                 print(
                     f"RETROFIT DRY RUN {existing_status.root}: already strict-valid "
                     "and fresh; no agent needed and no files changed"
                 )
+                _print_retrofit_next_steps(existing_status.root)
                 return 0
             finalization = finalize_retrofit(existing_status.root)
             hooks_summary = _retrofit_hooks_summary(finalization)
@@ -989,6 +1071,7 @@ def _execute(args: argparse.Namespace) -> int:
                 f"and fresh; registry {finalization.registration.action}; "
                 f"lock {finalization.lock.action}; {hooks_summary}; no agent needed"
             )
+            _print_retrofit_next_steps(existing_status.root)
             return 0
         if args.agent != "codex":
             raise CtxError(
@@ -1000,13 +1083,15 @@ def _execute(args: argparse.Namespace) -> int:
             target,
             dry_run=args.dry_run,
             finalize=None if args.dry_run else finalize_retrofit,
+            progress=_retrofit_progress,
         )
         _render_validation(result.validation)
         if not result.validation.valid:
             return 3 if result.validation.unsafe else 1
         if args.dry_run:
+            operation = "RETROFIT REVIEW" if args.review else "RETROFIT DRY RUN"
             print(
-                f"RETROFIT DRY RUN {result.root}: "
+                f"{operation} {result.root}: "
                 f"{len(result.proposed_manifests)} manifest(s) proposed; "
                 "no project files changed"
             )
@@ -1014,8 +1099,22 @@ def _execute(args: argparse.Namespace) -> int:
                 print(f"Agent summary: {_safe_display(result.agent_summary)}")
             if result.plan_id is not None:
                 print(f"Review exact proposal: ctx retrofit --show-plan {result.plan_id}")
-                no_hooks = " --no-hooks" if args.no_hooks else ""
-                print(f"Apply exact proposal: ctx retrofit --apply {result.plan_id}{no_hooks}")
+                review_required = any(
+                    item.disposition == "unresolved" for item in result.coverage
+                ) or any(
+                    item.status == "review-required" for item in result.conflicts
+                )
+                if review_required:
+                    print(
+                        "Apply blocked: resolve every unresolved area and "
+                        "review-required conflict, then rerun the dry run."
+                    )
+                else:
+                    no_hooks = " --no-hooks" if args.no_hooks else ""
+                    print(
+                        f"Apply exact proposal: ctx retrofit --apply "
+                        f"{result.plan_id}{no_hooks}"
+                    )
             return 0
         if not isinstance(result.finalization, RetrofitLifecycleResult):
             raise CtxError(
@@ -1033,6 +1132,7 @@ def _execute(args: argparse.Namespace) -> int:
         )
         if result.agent_summary.strip():
             print(f"Agent summary: {_safe_display(result.agent_summary)}")
+        _print_retrofit_next_steps(result.root)
         return 0
     if args.command == "hook":
         payload = read_hook_input(sys.stdin.buffer)
@@ -1051,8 +1151,21 @@ def _execute(args: argparse.Namespace) -> int:
             user=args.user,
         )
         print(f"{result.action} Codex hooks at {result.path}")
+        scope = "project" if result.scope == "project" else "user-wide"
+        print(
+            f"Codex CLI/TUI: run /hooks and review and trust the {scope} hooks."
+        )
         if result.scope == "project":
-            print("In Codex, run /hooks and review and trust the project hooks before using them.")
+            quoted_root = shlex.quote(str(result.path.parent.parent))
+            print(
+                "Codex desktop: /hooks is not available; run "
+                f"ctx hydrate --from {quoted_root} --task 'Map this project' immediately."
+            )
+        else:
+            print(
+                "Codex desktop: /hooks is not available; explicit ctx hydrate "
+                "works immediately inside any ctx project."
+            )
         return 0
     raise CtxError("cli.invalid", "unsupported command", exit_code=1)
 
@@ -1072,6 +1185,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments = [arguments[0], "--help", *arguments[2:]]
     if len(arguments) >= 2 and arguments[:2] == ["retrofit", "prompt"]:
         arguments[1:2] = ["--prompt"]
+    if len(arguments) >= 2 and arguments[:2] == ["retrofit", "review"]:
+        arguments[1:2] = ["--review", "--dry-run"]
     if len(arguments) >= 2 and arguments[:2] == ["reconcile", "prompt"]:
         arguments[1:2] = ["--prompt"]
     if len(arguments) >= 2 and arguments[:2] == ["reconcile", "inspect"]:

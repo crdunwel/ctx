@@ -10,7 +10,7 @@ from functools import partial
 from pathlib import Path
 from unittest import mock
 
-from ctx import lifecycle, reconciliation, retrofit_agent
+from ctx import freshness, lifecycle, reconciliation, retrofit_agent
 from ctx.diagnostics import CtxError
 from ctx.freshness import project_status, seal_freshness
 from ctx.retrofit import _open_directory_no_follow, inventory_repository
@@ -93,6 +93,26 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
     def jpeg(self, discriminator: int, *, size: int = 64) -> bytes:
         self.assertGreaterEqual(size, 8)
         return b"\xff\xd8\xff\xe0" + bytes([discriminator]) * (size - 6) + b"\xff\xd9"
+
+    def root_review_envelope(self, inventory: object) -> dict[str, object]:
+        eligible = tuple(getattr(inventory, "eligible_files"))
+        coverage: list[dict[str, object]] = []
+        for area in retrofit_agent._review_inventory_areas(inventory):
+            evidence = next(
+                path
+                for path in eligible
+                if retrofit_agent._evidence_is_under_area(path, area)
+            )
+            coverage.append(
+                {
+                    "area": area,
+                    "disposition": "node" if area == "." else "ancestor-covered",
+                    "scope": ".ctx/context.yaml",
+                    "evidence": [evidence],
+                    "summary": "The proposed root scope covers this bounded area.",
+                }
+            )
+        return {"coverage": coverage, "conflicts": []}
 
     def test_aggregate_media_over_budget_uses_a_catalog_and_fair_sample(self) -> None:
         root = self.base / "media-project"
@@ -297,6 +317,53 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
             self.fingerprint(first_result), self.fingerprint(second_result)
         )
 
+    def test_scoped_inspection_limits_visible_files_but_keeps_full_fingerprint(self) -> None:
+        root = self.base / "scoped-inspection-project"
+        (root / "alpha").mkdir(parents=True)
+        (root / "beta").mkdir()
+        (root / "README.md").write_text("Repository instructions.\n", encoding="utf-8")
+        (root / "alpha" / "main.py").write_text("ALPHA = True\n", encoding="utf-8")
+        (root / "beta" / "main.py").write_text("BETA = True\n", encoding="utf-8")
+        inventory = inventory_repository(root)
+        root_fd = _open_directory_no_follow(inventory.root)
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            scoped = retrofit_agent._build_filtered_snapshot(
+                inventory,
+                root_fd,
+                self.base / "scoped-inspection-snapshot",
+                inspection_paths=frozenset({"alpha/main.py"}),
+            )
+            expected_fingerprint = retrofit_agent._fingerprint_eligible_evidence(
+                inventory, root_fd
+            )
+            required = retrofit_agent._build_filtered_snapshot(
+                inventory,
+                root_fd,
+                self.base / "required-inspection-snapshot",
+                inspection_paths=frozenset({"alpha/main.py"}),
+                required_paths=frozenset({"beta/main.py"}),
+            )
+        finally:
+            os.close(root_fd)
+
+        self.assertEqual(scoped.evidence_fingerprint, expected_fingerprint)
+        self.assertIn("README.md", scoped.copied_paths)
+        self.assertIn("alpha/main.py", scoped.copied_paths)
+        self.assertNotIn("beta/main.py", scoped.copied_paths)
+        catalog = json.loads(
+            (
+                self.base
+                / "scoped-inspection-snapshot"
+                / retrofit_agent.INSPECTION_CATALOG_PATH
+            ).read_text(encoding="utf-8")
+        )
+        beta = next(item for item in catalog["files"] if item["path"] == "beta/main.py")
+        self.assertEqual(beta["representation"], "catalog-only")
+        self.assertIn("beta/main.py", required.copied_paths)
+        self.assertEqual(required.evidence_fingerprint, expected_fingerprint)
+
     def test_full_fingerprint_keeps_the_saved_plan_canonical_format(self) -> None:
         root = self.base / "canonical-fingerprint-project"
         (root / "photos").mkdir(parents=True)
@@ -500,6 +567,99 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
             "packages/zulu/tests/test_feature.py", result.copied_paths
         )
         self.assertEqual(result.copied_files, 2)
+
+    def test_single_app_layers_are_distinct_inspection_buckets(self) -> None:
+        root = self.base / "single-app-layer-project"
+        for directory in (
+            "VetInventory/Application",
+            "VetInventory/Features",
+            "VetInventoryTests",
+        ):
+            (root / directory).mkdir(parents=True)
+        for index in range(4):
+            (root / "VetInventory" / "Application" / f"Service{index}.swift").write_text(
+                f"let service{index} = {index}\n".ljust(64, "/"),
+                encoding="utf-8",
+            )
+        (root / "VetInventory" / "Features" / "CountHomeView.swift").write_text(
+            "struct CountHomeView {}\n".ljust(64, "/"),
+            encoding="utf-8",
+        )
+        (root / "VetInventoryTests" / "InventoryRepositoryTests.swift").write_text(
+            "final class InventoryRepositoryTests {}\n".ljust(64, "/"),
+            encoding="utf-8",
+        )
+
+        result = self.build_snapshot(
+            root,
+            self.base / "single-app-layer-snapshot",
+            byte_budget=192,
+        )
+
+        self.assertEqual(result.copied_files, 3)
+        self.assertTrue(
+            any(path.startswith("VetInventory/Application/") for path in result.copied_paths)
+        )
+        self.assertIn(
+            "VetInventory/Features/CountHomeView.swift", result.copied_paths
+        )
+        self.assertIn(
+            "VetInventoryTests/InventoryRepositoryTests.swift",
+            result.copied_paths,
+        )
+
+    def test_review_areas_do_not_inherit_presentation_truncation(self) -> None:
+        root = self.base / "coverage-area-project"
+        for index in range(30):
+            directory = root / f"area-{index:02d}"
+            directory.mkdir(parents=True)
+            (directory / "source.py").write_text("READY = True\n", encoding="utf-8")
+        nested = root / "zapp" / "Features"
+        nested.mkdir(parents=True)
+        (nested / "screen.py").write_text("SCREEN = True\n", encoding="utf-8")
+
+        inventory = inventory_repository(root)
+
+        self.assertIn("area-output-limit", inventory.partial_reasons)
+        self.assertIn(
+            "zapp/Features", retrofit_agent._review_inventory_areas(inventory)
+        )
+
+        with mock.patch.object(retrofit_agent, "MAX_COVERAGE_AREAS", 2):
+            with self.assertRaisesRegex(CtxError, "automated area limit"):
+                retrofit_agent._review_inventory_areas(inventory)
+
+    def test_review_envelope_accepts_exact_hostile_inventory_paths(self) -> None:
+        root = self.base / "hostile-review-path-project"
+        hostile_area = "unsafe\narea"
+        directory = root / hostile_area
+        directory.mkdir(parents=True)
+        hostile_path = f"{hostile_area}/bad\\name.py"
+        (directory / "bad\\name.py").write_text("READY = True\n", encoding="utf-8")
+        inventory = inventory_repository(root)
+        areas = retrofit_agent._review_inventory_areas(inventory)
+
+        coverage, conflicts = retrofit_agent._parse_review_envelope(
+            [
+                {
+                    "area": hostile_area,
+                    "disposition": "unresolved",
+                    "scope": None,
+                    "evidence": [hostile_path],
+                    "summary": "The hostile path is fingerprinted but needs review.",
+                }
+            ],
+            [],
+            code="test.invalid",
+            allowed_areas=areas,
+            allowed_evidence=frozenset(inventory.eligible_files),
+            inspectable_evidence=frozenset(),
+            allowed_scopes=frozenset(),
+        )
+
+        self.assertEqual(coverage[0].area, hostile_area)
+        self.assertEqual(coverage[0].evidence, (hostile_path,))
+        self.assertEqual(conflicts, ())
 
     def test_json_media_relationships_complete_a_source_output_pair(self) -> None:
         root = self.base / "relationship-project"
@@ -767,7 +927,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         self.assertIn("photos/source.jpeg", required)
 
         def fake_reconcile_agent(
-            _inventory: object,
+            inventory: object,
             _status: object,
             work_directory: Path,
             snapshot_root: Path,
@@ -1406,7 +1566,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         )
 
         def fake_agent(
-            _inventory: object,
+            inventory: object,
             work_directory: Path,
             _snapshot_root: Path,
             _inspection: object,
@@ -1419,6 +1579,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
                             {"path": ".ctx/context.yaml", "content": manifest}
                         ],
                         "summary": "root proposal",
+                        **self.root_review_envelope(inventory),
                     }
                 )
                 + "\n",
@@ -1466,7 +1627,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         )
 
         def fake_agent(
-            _inventory: object,
+            inventory: object,
             work_directory: Path,
             _snapshot_root: Path,
             _inspection: object,
@@ -1479,6 +1640,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
                             {"path": ".ctx/context.yaml", "content": manifest}
                         ],
                         "summary": "root proposal",
+                        **self.root_review_envelope(inventory),
                     }
                 )
                 + "\n",
@@ -1515,6 +1677,199 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         self.assertEqual(source.read_text(encoding="utf-8"), "VALUE = 2\n")
         self.assertFalse((root / ".ctx").exists())
 
+    def test_created_manifest_tamper_during_finalization_is_rejected(self) -> None:
+        root = self.base / "created-manifest-finalization-race"
+        root.mkdir()
+        (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        manifest = (
+            "version: 1\n"
+            "project:\n"
+            "  id: created-manifest-finalization-race\n"
+            "  name: Created Manifest Finalization Race\n"
+            "  aliases: []\n"
+            "node:\n"
+            "  id: root\n"
+            "  name: Created Manifest Finalization Race\n"
+        )
+
+        def fake_agent(
+            inventory: object,
+            work_directory: Path,
+            _snapshot_root: Path,
+            _inspection: object,
+        ) -> Path:
+            result = work_directory / "agent-result.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "manifests": [
+                            {"path": ".ctx/context.yaml", "content": manifest}
+                        ],
+                        "summary": "root proposal",
+                        **self.root_review_envelope(inventory),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return result
+
+        def tamper_during_finalize(
+            path: Path,
+            *,
+            verify_unchanged: object,
+        ) -> None:
+            target = path / ".ctx" / "context.yaml"
+            original = target.read_bytes()
+            metadata = target.stat()
+            target.write_bytes(original.replace(b"Created", b"Altered", 1))
+            try:
+                assert callable(verify_unchanged)
+                verify_unchanged()
+            finally:
+                target.write_bytes(original)
+                os.chmod(target, stat.S_IMODE(metadata.st_mode))
+                os.utime(
+                    target,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                    follow_symlinks=False,
+                )
+
+        with mock.patch.object(
+            retrofit_agent,
+            "_run_codex",
+            side_effect=fake_agent,
+        ):
+            with self.assertRaises(CtxError) as raised:
+                retrofit_agent.run_agent_retrofit(
+                    root,
+                    finalize=tamper_during_finalize,
+                )
+
+        self.assertEqual(raised.exception.code, "retrofit.destination-changed")
+        self.assertFalse((root / ".ctx").exists())
+
+    def test_reviewed_lock_cas_preserves_concurrent_update(self) -> None:
+        root = self.base / "reviewed-lock-cas-project"
+        (root / ".ctx").mkdir(parents=True)
+        source = root / "app.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        (root / ".ctx" / "context.yaml").write_text(
+            "version: 1\n"
+            "project:\n"
+            "  id: reviewed-lock-cas-project\n"
+            "  name: Reviewed Lock CAS Project\n"
+            "  aliases: []\n"
+            "node:\n"
+            "  id: root\n"
+            "  name: Reviewed Lock CAS Project\n",
+            encoding="utf-8",
+        )
+        lock = seal_freshness(root).path
+        baseline = lock.read_bytes()
+        source.write_text("VALUE = 2\n", encoding="utf-8")
+        concurrent = b'{"concurrent":true}\n'
+        read_lock = freshness._read_lock_at
+        reads = 0
+
+        def read_then_change(
+            directory_fd: int,
+            name: str,
+            path: Path,
+        ) -> object:
+            nonlocal reads
+            result = read_lock(directory_fd, name, path)
+            reads += 1
+            if reads == 1:
+                lock.write_bytes(concurrent)
+            return result
+
+        with mock.patch.object(
+            freshness,
+            "_read_lock_at",
+            side_effect=read_then_change,
+        ):
+            with self.assertRaises(CtxError) as raised:
+                freshness.seal_freshness(
+                    root,
+                    expected_previous=baseline,
+                    mismatch_code="lock.review-baseline-changed",
+                    mismatch_message="freshness lock changed after review",
+                )
+
+        self.assertEqual(raised.exception.code, "lock.review-baseline-changed")
+        self.assertEqual(lock.read_bytes(), concurrent)
+
+    def test_rollback_uses_written_bytes_and_preserves_later_lock(self) -> None:
+        root = self.base / "exact-lock-rollback-project"
+        (root / ".ctx").mkdir(parents=True)
+        (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / ".ctx" / "context.yaml").write_text(
+            "version: 1\n"
+            "project:\n"
+            "  id: exact-lock-rollback-project\n"
+            "  name: Exact Lock Rollback Project\n"
+            "  aliases: []\n"
+            "node:\n"
+            "  id: root\n"
+            "  name: Exact Lock Rollback Project\n",
+            encoding="utf-8",
+        )
+        lock = seal_freshness(root).path
+        baseline = lock.read_bytes()
+        feature = root / "feature" / ".ctx"
+        feature.mkdir(parents=True)
+        (feature / "context.yaml").write_text(
+            "version: 1\n"
+            "node:\n"
+            "  id: feature\n"
+            "  name: Feature\n",
+            encoding="utf-8",
+        )
+        concurrent = b'{"concurrent":true}\n'
+        seal = lifecycle.seal_freshness
+
+        def seal_then_change(path: Path, **kwargs: object) -> object:
+            result = seal(path, **kwargs)
+            result.path.write_bytes(concurrent)
+            return result
+
+        with (
+            mock.patch.object(
+                lifecycle,
+                "seal_freshness",
+                side_effect=seal_then_change,
+            ),
+            mock.patch.object(
+                lifecycle,
+                "register_project",
+                side_effect=CtxError("registry.injected", "injected failure"),
+            ),
+        ):
+            with self.assertRaises(CtxError) as raised:
+                lifecycle.complete_retrofit(
+                    root,
+                    enable_codex_hooks=False,
+                    replace_fresh_lock=baseline,
+                )
+
+        self.assertEqual(raised.exception.code, "lock.rollback-failed")
+        self.assertEqual(lock.read_bytes(), concurrent)
+
+    def test_fresh_baseline_propagates_operational_status_errors(self) -> None:
+        root = self.base / "baseline-status-error"
+        root.mkdir()
+        injected = CtxError("status.operational", "injected status failure", exit_code=4)
+        with mock.patch.object(
+            retrofit_agent,
+            "project_status",
+            side_effect=injected,
+        ):
+            with self.assertRaises(CtxError) as raised:
+                retrofit_agent._fresh_lock_baseline(root)
+
+        self.assertIs(raised.exception, injected)
+
     def test_source_change_during_registration_rolls_back_all_lifecycle_writes(
         self,
     ) -> None:
@@ -1534,7 +1889,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         )
 
         def fake_agent(
-            _inventory: object,
+            inventory: object,
             work_directory: Path,
             _snapshot_root: Path,
             _inspection: object,
@@ -1547,6 +1902,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
                             {"path": ".ctx/context.yaml", "content": manifest}
                         ],
                         "summary": "root proposal",
+                        **self.root_review_envelope(inventory),
                     }
                 )
                 + "\n",
@@ -1656,7 +2012,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         )
 
         def fake_agent(
-            _inventory: object,
+            inventory: object,
             work_directory: Path,
             _snapshot_root: Path,
             _inspection: object,
@@ -1669,6 +2025,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
                             {"path": ".ctx/context.yaml", "content": manifest}
                         ],
                         "summary": "root proposal",
+                        **self.root_review_envelope(inventory),
                     }
                 )
                 + "\n",

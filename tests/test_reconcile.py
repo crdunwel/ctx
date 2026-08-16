@@ -65,7 +65,15 @@ from pathlib import Path
 
 args = sys.argv[1:]
 result = Path(args[args.index("--output-last-message") + 1])
+workspace = Path(args[args.index("-C") + 1])
 mode = os.environ.get("FAKE_RECONCILE_MODE", "ack")
+record = os.environ.get("FAKE_RECONCILE_RECORD")
+if record:
+    Path(record).write_text(json.dumps(sorted(
+        path.relative_to(workspace).as_posix()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    )), encoding="utf-8")
 root_manifest = """version: 1
 project:
   id: reconcile-project
@@ -90,10 +98,13 @@ elif mode == "graph-invalid":
         "summary": "Invalid proposal for rollback coverage.",
     }}
 else:
+    acknowledgement_uri = os.environ.get(
+        "FAKE_RECONCILE_URI", "ctx://reconcile-project"
+    )
     payload = {{
         "manifests": [],
         "acknowledgements": [{{
-            "uri": "ctx://reconcile-project",
+            "uri": acknowledgement_uri,
             "reason": "Implementation-only value change with no durable contract impact."
         }}],
         "summary": "Reviewed as implementation-only.",
@@ -132,6 +143,127 @@ result.write_text(json.dumps(payload, sort_keys=True) + "\\n", encoding="utf-8")
         self.assertEqual(manifest.read_bytes(), before)
         status = self.run_ctx("status", "--check", "--json")
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
+    def test_agent_snapshot_exposes_affected_scope_not_unrelated_sibling_source(self) -> None:
+        alpha = self.project / "alpha"
+        beta = self.project / "beta"
+        alpha.mkdir()
+        beta.mkdir()
+        alpha_source = alpha / "source.py"
+        beta_source = beta / "unrelated.py"
+        root_contract = self.project / "root_contract.py"
+        alpha_source.write_text("VALUE = 'alpha'\n", encoding="utf-8")
+        beta_source.write_text("SIBLING_CANARY = 'private-to-beta'\n", encoding="utf-8")
+        (beta / "AGENT.md").write_text(
+            "SIBLING_INSTRUCTION_CANARY\n", encoding="utf-8"
+        )
+        root_contract.write_text("ROOT_CONTRACT = True\n", encoding="utf-8")
+        for path, node_id, name in (
+            (alpha, "alpha", "Alpha"),
+            (beta, "beta", "Beta"),
+        ):
+            initialized = self.run_ctx(
+                "node",
+                str(path),
+                "--id",
+                node_id,
+                "--name",
+                name,
+            )
+            self.assertEqual(
+                initialized.returncode, 0, initialized.stdout + initialized.stderr
+            )
+        root_manifest = self.project / ".ctx" / "context.yaml"
+        root_manifest.write_text(
+            root_manifest.read_text(encoding="utf-8")
+            + "artifacts:\n"
+            + "  - path: root_contract.py\n"
+            + "    role: Root contract inherited by child reviews.\n",
+            encoding="utf-8",
+        )
+        seal_freshness(self.project)
+        alpha_source.write_text("VALUE = 'changed'\n", encoding="utf-8")
+        _directory, environment = self.fake_codex()
+        record = self.base / "reconcile-snapshot.json"
+        environment.update(
+            {
+                "FAKE_RECONCILE_RECORD": str(record),
+                "FAKE_RECONCILE_URI": "ctx://reconcile-project/alpha",
+            }
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied = set(json.loads(record.read_text(encoding="utf-8")))
+        self.assertIn("alpha/source.py", copied)
+        self.assertIn("root_contract.py", copied)
+        self.assertNotIn("beta/unrelated.py", copied)
+        self.assertNotIn("beta/AGENT.md", copied)
+        self.assertNotIn("beta/.ctx/context.yaml", copied)
+        self.assertNotIn("app.py", copied)
+
+    def test_agent_snapshot_includes_bounded_linked_peer_evidence(self) -> None:
+        alpha = self.project / "alpha"
+        beta = self.project / "beta"
+        alpha.mkdir()
+        beta.mkdir()
+        alpha_source = alpha / "source.py"
+        beta_contract = beta / "consumer.py"
+        beta_internal = beta / "internal.py"
+        alpha_source.write_text("VALUE = 'alpha'\n", encoding="utf-8")
+        beta_contract.write_text("CONSUMES_ALPHA = True\n", encoding="utf-8")
+        beta_internal.write_text("PRIVATE_BETA = True\n", encoding="utf-8")
+        for path, node_id, name in (
+            (alpha, "alpha", "Alpha"),
+            (beta, "beta", "Beta"),
+        ):
+            initialized = self.run_ctx(
+                "node",
+                str(path),
+                "--id",
+                node_id,
+                "--name",
+                name,
+            )
+            self.assertEqual(
+                initialized.returncode, 0, initialized.stdout + initialized.stderr
+            )
+        alpha_manifest = alpha / ".ctx" / "context.yaml"
+        alpha_manifest.write_text(
+            alpha_manifest.read_text(encoding="utf-8")
+            + "links:\n"
+            + "  - target: ctx://reconcile-project/beta\n"
+            + "    relation: related_to\n",
+            encoding="utf-8",
+        )
+        beta_manifest = beta / ".ctx" / "context.yaml"
+        beta_manifest.write_text(
+            beta_manifest.read_text(encoding="utf-8")
+            + "artifacts:\n"
+            + "  - path: consumer.py\n"
+            + "    role: Public consumer contract for Alpha behavior.\n",
+            encoding="utf-8",
+        )
+        seal_freshness(self.project)
+        alpha_source.write_text("VALUE = 'changed'\n", encoding="utf-8")
+        _directory, environment = self.fake_codex()
+        record = self.base / "linked-reconcile-snapshot.json"
+        environment.update(
+            {
+                "FAKE_RECONCILE_RECORD": str(record),
+                "FAKE_RECONCILE_URI": "ctx://reconcile-project/alpha",
+            }
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied = set(json.loads(record.read_text(encoding="utf-8")))
+        self.assertIn("alpha/source.py", copied)
+        self.assertIn("beta/.ctx/context.yaml", copied)
+        self.assertIn("beta/consumer.py", copied)
+        self.assertNotIn("beta/internal.py", copied)
 
     def test_update_changes_only_manifest_then_refreshes_lock(self) -> None:
         source_before = self.source.read_bytes()

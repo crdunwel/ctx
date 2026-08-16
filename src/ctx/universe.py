@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .diagnostics import CtxError, NotFoundError
+from .diagnostics import CtxError, NotFoundError, UnsafePathError
 from .models import Item, LoadedNode
 from .registry import Registry, RegistryEntry, load_registry, resolve_project
 from .uri import ContextUri, item_uri, parse_ctx_uri
@@ -79,6 +79,11 @@ class SearchHit:
     node_name: str
     kind: str
     score: int
+    trust: str
+    reuse_policy: str
+    match_kind: str
+    matched_field: str
+    matched_tokens: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,7 +94,32 @@ class SearchHit:
             "node": self.node_name,
             "kind": self.kind,
             "score": self.score,
+            "trust": self.trust,
+            "reuse_policy": self.reuse_policy,
+            "match": {
+                "kind": self.match_kind,
+                "field": self.matched_field,
+                "tokens": list(self.matched_tokens),
+            },
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchMatch:
+    score: int
+    kind: str
+    field: str
+    tokens: tuple[str, ...]
+
+
+def require_context_reuse(entry: RegistryEntry) -> None:
+    """Enforce the registry's hard deny before reading project context."""
+
+    if entry.reuse_policy == "prohibited":
+        raise UnsafePathError(
+            "policy.prohibited",
+            f"registered project {entry.project_id} prohibits context reuse",
+        )
 
 
 def _load_indexed(entry: RegistryEntry, *, strict: bool = False) -> IndexedProject:
@@ -125,10 +155,92 @@ def indexed_projects(
     selected = registry or load_registry()
     entries: Iterable[RegistryEntry]
     if project is None:
-        entries = selected.projects
+        entries = tuple(
+            entry
+            for entry in selected.projects
+            if entry.reuse_policy != "prohibited"
+        )
     else:
-        entries = (resolve_project(project, registry=selected),)
+        entry = resolve_project(project, registry=selected)
+        require_context_reuse(entry)
+        entries = (entry,)
     return tuple(_load_indexed(entry) for entry in entries)
+
+
+def indexed_project_for_root(
+    root: Path, *, registry: Registry | None = None
+) -> IndexedProject:
+    """Resolve an external checkout only through an exact registry root."""
+
+    selected = registry or load_registry()
+    try:
+        resolved_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise UnsafePathError(
+            "reference.external-path-unsafe",
+            f"external context path is unavailable: {root}",
+        ) from exc
+    matches: list[RegistryEntry] = []
+    for entry in selected.projects:
+        try:
+            entry_root = entry.root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if entry_root == resolved_root:
+            matches.append(entry)
+    if not matches:
+        raise UnsafePathError(
+            "reference.external-path-unregistered",
+            "external filesystem context must belong to an exact registered checkout: "
+            f"{resolved_root}",
+        )
+    if len(matches) > 1:
+        raise UnsafePathError(
+            "registry.root-conflict",
+            f"external checkout is registered more than once: {resolved_root}",
+        )
+    entry = matches[0]
+    require_context_reuse(entry)
+    return _load_indexed(entry)
+
+
+def indexed_project_for_path(
+    path: Path, *, registry: Registry | None = None
+) -> IndexedProject:
+    """Gate an external path through its nearest containing registered checkout."""
+
+    selected = registry or load_registry()
+    try:
+        resolved_path = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise UnsafePathError(
+            "reference.external-path-unsafe",
+            f"external context path is unavailable: {path}",
+        ) from exc
+    matches: list[tuple[int, RegistryEntry]] = []
+    for entry in selected.projects:
+        try:
+            entry_root = entry.root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_path == entry_root or resolved_path.is_relative_to(entry_root):
+            matches.append((len(entry_root.parts), entry))
+    if not matches:
+        raise UnsafePathError(
+            "reference.external-path-unregistered",
+            "external filesystem context must belong to a registered checkout: "
+            f"{resolved_path}",
+        )
+    depth = max(value[0] for value in matches)
+    leaders = [entry for candidate_depth, entry in matches if candidate_depth == depth]
+    if len(leaders) != 1:
+        raise UnsafePathError(
+            "registry.root-conflict",
+            f"external path belongs to multiple registered checkouts: {resolved_path}",
+        )
+    entry = leaders[0]
+    require_context_reuse(entry)
+    return _load_indexed(entry)
 
 
 def _node_by_uri(indexed: IndexedProject, node_uri: str) -> LoadedNode:
@@ -142,6 +254,7 @@ def resolve_uri(reference: str, *, registry: Registry | None = None) -> Resolved
     parsed = parse_ctx_uri(reference)
     selected = registry or load_registry()
     entry = resolve_project(parsed.project_id, registry=selected)
+    require_context_reuse(entry)
     indexed = _load_indexed(entry)
     node_reference = str(ContextUri(parsed.project_id, parsed.node_ids))
     node = _node_by_uri(indexed, node_reference)
@@ -183,6 +296,15 @@ def resolve_reference(reference: str, *, project: str | None = None) -> Resolved
     if reference.startswith("ctx://"):
         return resolve_uri(reference)
     registry = load_registry()
+    needle = _normalized(reference)
+    for entry in registry.projects:
+        project_keys = {
+            _normalized(entry.project_id),
+            _normalized(entry.name),
+            *(_normalized(value) for value in entry.aliases),
+        }
+        if needle in project_keys and entry.reuse_policy == "prohibited":
+            require_context_reuse(entry)
     projects = indexed_projects(registry=registry, project=project)
     matches = _exact_candidates(reference, projects)
     if not matches:
@@ -195,34 +317,104 @@ def resolve_reference(reference: str, *, project: str | None = None) -> Resolved
     return matches[0]
 
 
-def _score(query: str, fields: tuple[str, ...], *, identity: str, title: str) -> int:
+def _score(
+    query: str,
+    fields: tuple[tuple[str, str], ...],
+    *,
+    identities: tuple[tuple[str, str], ...],
+    titles: tuple[tuple[str, str], ...],
+) -> _SearchMatch | None:
     normalized_query = _normalized(query)
     query_tokens = set(normalized_query.split())
-    normalized_identity = _normalized(identity)
-    normalized_title = _normalized(title)
-    if normalized_query == normalized_identity:
-        return 10_000
-    if normalized_query == normalized_title:
-        return 9_000
-    if normalized_identity.startswith(normalized_query):
-        return 7_000
-    if normalized_title.startswith(normalized_query):
-        return 6_000
-    field_tokens = set()
-    haystack = ""
-    for field in fields:
-        normalized = _normalized(field)
-        field_tokens.update(normalized.split())
-        haystack += " " + normalized
-    overlap = len(query_tokens & field_tokens)
-    if query_tokens and query_tokens.issubset(field_tokens):
-        return 4_000 + overlap * 100
-    if normalized_query and normalized_query in haystack:
-        return 2_000 + overlap * 100
-    return overlap * 100
+    if not normalized_query:
+        return None
+
+    for field, value in identities:
+        normalized = _normalized(value)
+        if normalized_query == normalized:
+            return _SearchMatch(
+                10_000,
+                "identity-exact",
+                field,
+                tuple(sorted(query_tokens)),
+            )
+    for field, value in titles:
+        normalized = _normalized(value)
+        if normalized_query == normalized:
+            return _SearchMatch(
+                9_000,
+                "title-exact",
+                field,
+                tuple(sorted(query_tokens)),
+            )
+    for field, value in identities:
+        normalized = _normalized(value)
+        if normalized.startswith(normalized_query):
+            return _SearchMatch(
+                7_000,
+                "identity-prefix",
+                field,
+                tuple(sorted(query_tokens)),
+            )
+    for field, value in titles:
+        normalized = _normalized(value)
+        if normalized.startswith(normalized_query):
+            return _SearchMatch(
+                6_000,
+                "title-prefix",
+                field,
+                tuple(sorted(query_tokens)),
+            )
+
+    best: _SearchMatch | None = None
+    for field, value in fields:
+        normalized = _normalized(value)
+        field_tokens = set(normalized.split())
+        matched_tokens = tuple(sorted(query_tokens & field_tokens))
+        overlap = len(matched_tokens)
+        padded_query = f" {normalized_query} "
+        padded_field = f" {normalized} "
+        if normalized_query and padded_query in padded_field:
+            candidate = _SearchMatch(
+                4_500 + overlap * 100,
+                "field-phrase",
+                field,
+                matched_tokens,
+            )
+        elif query_tokens and query_tokens.issubset(field_tokens):
+            candidate = _SearchMatch(
+                4_000 + overlap * 100,
+                "field-all-tokens",
+                field,
+                matched_tokens,
+            )
+        elif query_tokens and all(
+            any(field_token.startswith(query_token) for field_token in field_tokens)
+            for query_token in query_tokens
+        ):
+            candidate = _SearchMatch(
+                3_000 + overlap * 100,
+                "field-token-prefix",
+                field,
+                matched_tokens,
+            )
+        elif overlap:
+            candidate = _SearchMatch(
+                overlap * 100,
+                "field-token-overlap",
+                field,
+                matched_tokens,
+            )
+        else:
+            continue
+        if best is None or candidate.score > best.score:
+            best = candidate
+    return best
 
 
-def search_context(query: str, *, project: str | None = None, limit: int = 50) -> tuple[SearchHit, ...]:
+def search_context(
+    query: str, *, project: str | None = None, limit: int = 50
+) -> tuple[SearchHit, ...]:
     if not query.strip():
         raise CtxError("search.query-required", "search query cannot be empty", exit_code=1)
     hits: list[SearchHit] = []
@@ -230,22 +422,36 @@ def search_context(query: str, *, project: str | None = None, limit: int = 50) -
         entry = indexed.entry
         for node in indexed.validation.nodes:
             manifest = node.manifest
-            node_score = _score(
+            is_root = node.uri == f"ctx://{indexed.validation.project.id}"
+            node_fields: list[tuple[str, str]] = [
+                ("node.id", manifest.node.id),
+                ("node.name", manifest.node.name),
+                ("node.summary", manifest.node.summary or ""),
+                *(("artifact.path", artifact.path) for artifact in manifest.artifacts),
+                *(("artifact.role", artifact.role) for artifact in manifest.artifacts),
+            ]
+            node_identities: list[tuple[str, str]] = [("node.id", manifest.node.id)]
+            node_titles: list[tuple[str, str]] = [("node.name", manifest.node.name)]
+            if is_root:
+                node_identities.extend(
+                    [("project.id", entry.project_id)]
+                    + [("project.alias", value) for value in entry.aliases]
+                )
+                node_titles.append(("project.name", entry.name))
+                node_fields.extend(
+                    [
+                        ("project.id", entry.project_id),
+                        ("project.name", entry.name),
+                        *(("project.alias", value) for value in entry.aliases),
+                    ]
+                )
+            node_match = _score(
                 query,
-                (
-                    entry.project_id,
-                    entry.name,
-                    *entry.aliases,
-                    manifest.node.id,
-                    manifest.node.name,
-                    manifest.node.summary or "",
-                    *(artifact.path for artifact in manifest.artifacts),
-                    *(artifact.role for artifact in manifest.artifacts),
-                ),
-                identity=manifest.node.id,
-                title=manifest.node.name,
+                tuple(node_fields),
+                identities=tuple(node_identities),
+                titles=tuple(node_titles),
             )
-            if node_score:
+            if node_match is not None:
                 hits.append(
                     SearchHit(
                         node.uri,
@@ -254,17 +460,28 @@ def search_context(query: str, *, project: str | None = None, limit: int = 50) -
                         entry.project_id,
                         manifest.node.name,
                         "node",
-                        node_score,
+                        node_match.score,
+                        entry.trust,
+                        entry.reuse_policy,
+                        node_match.kind,
+                        node_match.field,
+                        node_match.tokens,
                     )
                 )
             for item in manifest.items:
-                item_score = _score(
+                item_match = _score(
                     query,
-                    (item.id, item.kind, item.title, item.summary, item.reason or ""),
-                    identity=item.id,
-                    title=item.title,
+                    (
+                        ("item.id", item.id),
+                        ("item.kind", item.kind),
+                        ("item.title", item.title),
+                        ("item.summary", item.summary),
+                        ("item.reason", item.reason or ""),
+                    ),
+                    identities=(("item.id", item.id),),
+                    titles=(("item.title", item.title),),
                 )
-                if item_score:
+                if item_match is not None:
                     hits.append(
                         SearchHit(
                             item_uri(node.uri, item.id),
@@ -273,7 +490,12 @@ def search_context(query: str, *, project: str | None = None, limit: int = 50) -
                             entry.project_id,
                             manifest.node.name,
                             item.kind,
-                            item_score,
+                            item_match.score,
+                            entry.trust,
+                            entry.reuse_policy,
+                            item_match.kind,
+                            item_match.field,
+                            item_match.tokens,
                         )
                     )
     hits.sort(key=lambda value: (-value.score, value.uri, value.kind, value.title))

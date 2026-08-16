@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ctx.diagnostics import CtxError, UnsafePathError
-from ctx.integration import install_codex_hooks, remove_created_codex_hooks
+from ctx.integration import (
+    ensure_codex_hooks_for_retrofit,
+    install_codex_hooks,
+    remove_created_codex_hooks,
+)
+from ctx.lifecycle import complete_retrofit
 from ctx.services import init_project
 
 
@@ -192,6 +197,88 @@ class CodexHookIntegrationTests(unittest.TestCase):
             install_codex_hooks(project=self.project, user=True)
         self.assertEqual(raised.exception.code, "integration.mode-conflict")
         self.assertFalse((self.project / ".codex").exists())
+
+    def test_retrofit_lifecycle_reuses_canonical_user_hooks(self) -> None:
+        home = self.base / "isolated-home"
+        home.mkdir()
+        ctx_home = self.base / "isolated-ctx-home"
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "CTX_HOME": str(ctx_home)},
+            clear=False,
+        ):
+            user_hooks = install_codex_hooks(user=True)
+            before = user_hooks.path.read_bytes()
+
+            lifecycle = complete_retrofit(self.project)
+
+            self.assertIsNotNone(lifecycle.hooks)
+            assert lifecycle.hooks is not None
+            self.assertEqual(lifecycle.hooks.action, "unchanged")
+            self.assertEqual(lifecycle.hooks.scope, "user")
+            self.assertEqual(lifecycle.hooks.path, user_hooks.path)
+            self.assertFalse((self.project / ".codex").exists())
+            self.assertTrue((self.project / ".ctx" / "lock.json").is_file())
+            self.assertTrue((ctx_home / "registry.json").is_file())
+
+            remove_created_codex_hooks(lifecycle.hooks)
+            self.assertEqual(user_hooks.path.read_bytes(), before)
+
+    def test_retrofit_helper_keeps_project_conflicts_fail_closed(self) -> None:
+        home = self.base / "isolated-home"
+        home.mkdir()
+        target = self.project / ".codex" / "hooks.json"
+        target.parent.mkdir()
+        original = b'{"hooks":{"Existing":[]}}\n'
+        target.write_bytes(original)
+
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            install_codex_hooks(user=True)
+            with self.assertRaises(CtxError) as raised:
+                ensure_codex_hooks_for_retrofit(self.project)
+
+        self.assertEqual(raised.exception.code, "integration.hooks-conflict")
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_explicit_project_install_still_creates_with_user_hooks_present(self) -> None:
+        home = self.base / "isolated-home"
+        home.mkdir()
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            install_codex_hooks(user=True)
+            project_hooks = install_codex_hooks(project=self.project)
+
+        self.assertEqual(project_hooks.action, "created")
+        self.assertEqual(project_hooks.scope, "project")
+        self.assertTrue((self.project / ".codex" / "hooks.json").is_file())
+
+    def test_lifecycle_rollback_never_removes_reused_user_hooks(self) -> None:
+        home = self.base / "isolated-home"
+        home.mkdir()
+        ctx_home = self.base / "isolated-ctx-home"
+        conflicting = self.base / "conflicting-project"
+        conflicting.mkdir()
+        init_project(
+            conflicting,
+            project_id="integration-project",
+            name="Conflicting Project",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "CTX_HOME": str(ctx_home)},
+            clear=False,
+        ):
+            user_hooks = install_codex_hooks(user=True)
+            before = user_hooks.path.read_bytes()
+            complete_retrofit(conflicting, enable_codex_hooks=False)
+
+            with self.assertRaises(CtxError) as raised:
+                complete_retrofit(self.project)
+
+            self.assertEqual(raised.exception.code, "registry.project-conflict")
+            self.assertEqual(user_hooks.path.read_bytes(), before)
+            self.assertFalse((self.project / ".codex").exists())
+            self.assertFalse((self.project / ".ctx" / "lock.json").exists())
 
 
 if __name__ == "__main__":

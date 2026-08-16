@@ -6,7 +6,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from .diagnostics import CtxError, UnsafePathError
 from .discovery import find_project_root
@@ -59,6 +59,54 @@ class CodexHooksInstallResult:
     directory_identity: tuple[int, int] | None = None
     file_identity: tuple[int, int] | None = None
     file_signature: tuple[int, int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexHooksTargetDiagnosis:
+    """Read-only status for one Codex hook configuration layer."""
+
+    scope: Literal["project", "user"]
+    path: Path
+    status: Literal["missing", "canonical", "noncanonical", "unsafe"]
+    detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "scope": self.scope,
+            "path": str(self.path),
+            "status": self.status,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CodexHooksDiagnosis:
+    """JSON-ready, read-only diagnosis of project and user Codex hooks."""
+
+    project_root: Path
+    project: CodexHooksTargetDiagnosis
+    user: CodexHooksTargetDiagnosis
+    possible_duplicate_execution: bool
+    trust_inspectable: bool
+    recommendations: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_root": str(self.project_root),
+            "hooks": {
+                "project": self.project.to_dict(),
+                "user": self.user.to_dict(),
+            },
+            "possible_duplicate_execution": self.possible_duplicate_execution,
+            "trust": {
+                "inspectable": self.trust_inspectable,
+                "detail": (
+                    "ctx cannot inspect whether Codex has trusted an exact hook "
+                    "definition."
+                ),
+            },
+            "recommendations": list(self.recommendations),
+        }
 
 
 def _canonical_hooks() -> bytes:
@@ -278,6 +326,169 @@ def _read_existing(parent_fd: int, path: Path, expected: bytes) -> str | None:
     return "same" if b"".join(chunks) == expected else "different"
 
 
+def _diagnose_hooks_target(
+    base: Path, *, scope: Literal["project", "user"]
+) -> CodexHooksTargetDiagnosis:
+    """Inspect one hook layer without following or parsing hook configuration."""
+
+    target_directory = base / _CODEX_DIRECTORY_NAME
+    target = target_directory / _HOOKS_FILE_NAME
+    base_fd: int | None = None
+    parent_fd: int | None = None
+    try:
+        base_fd = _open_base_directory(base)
+        try:
+            directory_before = os.stat(
+                _CODEX_DIRECTORY_NAME,
+                dir_fd=base_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return CodexHooksTargetDiagnosis(
+                scope,
+                target,
+                "missing",
+                "the Codex configuration directory does not exist",
+            )
+        except OSError as exc:
+            raise CtxError(
+                "integration.codex-directory-read-failed",
+                f"cannot inspect Codex hook directory {target_directory}: {exc}",
+                exit_code=4,
+            ) from exc
+
+        if stat.S_ISLNK(directory_before.st_mode):
+            raise UnsafePathError(
+                "integration.codex-directory-symlink",
+                f"Codex hook directory cannot be a symlink: {target_directory}",
+            )
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise UnsafePathError(
+                "integration.codex-directory-not-directory",
+                f"Codex hook directory is not a directory: {target_directory}",
+            )
+
+        parent_fd = os.open(
+            _CODEX_DIRECTORY_NAME,
+            _directory_flags(),
+            dir_fd=base_fd,
+        )
+        directory_opened = os.fstat(parent_fd)
+        if not stat.S_ISDIR(directory_opened.st_mode) or (
+            directory_opened.st_dev,
+            directory_opened.st_ino,
+        ) != (directory_before.st_dev, directory_before.st_ino):
+            raise UnsafePathError(
+                "integration.codex-directory-changed",
+                f"Codex hook directory changed while it was inspected: {target_directory}",
+            )
+
+        existing = _read_existing(parent_fd, target, _canonical_hooks())
+        directory_current = os.stat(
+            _CODEX_DIRECTORY_NAME,
+            dir_fd=base_fd,
+            follow_symlinks=False,
+        )
+        if (
+            directory_current.st_dev,
+            directory_current.st_ino,
+        ) != (directory_opened.st_dev, directory_opened.st_ino):
+            raise UnsafePathError(
+                "integration.codex-directory-changed",
+                f"Codex hook directory changed while it was inspected: {target_directory}",
+            )
+
+        if existing is None:
+            return CodexHooksTargetDiagnosis(
+                scope,
+                target,
+                "missing",
+                "hooks.json does not exist",
+            )
+        if existing == "same":
+            return CodexHooksTargetDiagnosis(
+                scope,
+                target,
+                "canonical",
+                "hooks.json exactly matches the ctx hook configuration",
+            )
+        return CodexHooksTargetDiagnosis(
+            scope,
+            target,
+            "noncanonical",
+            "hooks.json exists but does not exactly match the ctx hook configuration",
+        )
+    except CtxError as exc:
+        return CodexHooksTargetDiagnosis(scope, target, "unsafe", exc.message)
+    except OSError as exc:
+        return CodexHooksTargetDiagnosis(
+            scope,
+            target,
+            "unsafe",
+            f"cannot safely inspect Codex hooks: {exc}",
+        )
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if base_fd is not None:
+            os.close(base_fd)
+
+
+def diagnose_codex_hooks(
+    path: Path | None = None, *, user_home: Path | None = None
+) -> CodexHooksDiagnosis:
+    """Diagnose ctx's Codex hook integration without writing or inferring trust."""
+
+    project_root, _project = find_project_root(path or Path.cwd())
+    home = absolute_lexical(user_home or Path.home())
+    project = _diagnose_hooks_target(project_root, scope="project")
+    user = _diagnose_hooks_target(home, scope="user")
+    possible_duplicate = project.status == "canonical" and user.status == "canonical"
+
+    recommendations = [
+        (
+            "Explicit ctx commands work immediately; try: ctx hydrate --from "
+            f"{project_root} --task \"Orient me to this project\"."
+        ),
+        (
+            "/hooks is the Codex CLI/TUI hook browser; Codex desktop has no "
+            "documented /hooks command."
+        ),
+        (
+            "Hook trust is not inspectable by ctx; Codex may require review of "
+            "the exact hook definition before activation."
+        ),
+    ]
+    if project.status == "missing" and user.status == "canonical":
+        recommendations.append(
+            "Canonical user-wide ctx hooks already cover this project; no "
+            "project hook file is needed."
+        )
+    elif project.status == "missing":
+        recommendations.append(
+            "Install project hooks with: ctx integrate codex --hooks --project "
+            f"{project_root}."
+        )
+    elif project.status in {"noncanonical", "unsafe"}:
+        recommendations.append(
+            f"Review {project.path} manually; ctx will not replace or parse it."
+        )
+    if possible_duplicate:
+        recommendations.append(
+            "Canonical hooks exist at both user and project scope; keep one "
+            "scope to avoid possible duplicate execution."
+        )
+
+    return CodexHooksDiagnosis(
+        project_root=project_root,
+        project=project,
+        user=user,
+        possible_duplicate_execution=possible_duplicate,
+        trust_inspectable=False,
+        recommendations=tuple(recommendations),
+    )
+
+
 def _write_all(descriptor: int, content: bytes) -> None:
     remaining = memoryview(content)
     while remaining:
@@ -475,6 +686,43 @@ def install_codex_hooks(
         file_identity,
         file_signature,
     )
+
+
+def ensure_codex_hooks_for_retrofit(
+    project: Path, *, user_home: Path | None = None
+) -> CodexHooksInstallResult:
+    """Reuse canonical user hooks or safely provision project hooks.
+
+    Bare retrofit is an onboarding convenience, so it avoids creating a
+    duplicate project hook when the exact canonical configuration is already
+    installed user-wide. Explicit integration continues to call
+    :func:`install_codex_hooks` and therefore always targets its requested
+    scope.
+
+    Existing project configuration always wins. Canonical project hooks are
+    verified idempotently; noncanonical or unsafe project paths flow through
+    the normal installer and retain its fail-closed behavior.
+    """
+
+    project_root, _project_identity = find_project_root(project)
+    project_status = _diagnose_hooks_target(project_root, scope="project")
+    if project_status.status != "missing":
+        return install_codex_hooks(project=project_root)
+
+    home = absolute_lexical(user_home or Path.home())
+    user_status = _diagnose_hooks_target(home, scope="user")
+    if user_status.status == "canonical":
+        # Recheck the project layer after inspecting HOME. If anything appeared
+        # meanwhile, let the ordinary installer verify it or fail closed.
+        project_status = _diagnose_hooks_target(project_root, scope="project")
+        if project_status.status == "missing":
+            return CodexHooksInstallResult(
+                action="unchanged",
+                path=user_status.path,
+                scope="user",
+            )
+
+    return install_codex_hooks(project=project_root)
 
 
 def remove_created_codex_hooks(result: CodexHooksInstallResult) -> None:

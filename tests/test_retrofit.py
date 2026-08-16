@@ -602,6 +602,68 @@ class RetrofitPromptTests(unittest.TestCase):
         self.assertNotIn('"repository_instruction_files": [\n        "README.md"', inventory)
         self.assertIn("Ordinary README", result.stdout)
 
+    def test_vetscan_shaped_inventory_surfaces_features_tests_and_build(self) -> None:
+        root = self.base / "vetscan-shaped"
+        for directory in (
+            "Scripts",
+            "VetInventory/Application",
+            "VetInventory/Data",
+            "VetInventory/Domain",
+            "VetInventory/Features",
+            "VetInventory.xcodeproj",
+            "VetInventoryTests",
+        ):
+            (root / directory).mkdir(parents=True)
+        files = {
+            "AGENT.md": "Repository guidance.\n",
+            "README.md": "Inventory application.\n",
+            "Scripts/GenerateProject.swift": "print(\"generate\")\n",
+            "VetInventory/AppRootView.swift": "struct AppRootView {}\n",
+            "VetInventory/Application/InventoryCoordinator.swift": "actor InventoryCoordinator {}\n",
+            "VetInventory/Data/InventoryRepository.swift": "protocol InventoryRepository {}\n",
+            "VetInventory/Domain/InventoryDomain.swift": "struct InventoryItem {}\n",
+            "VetInventory/Features/CountHomeView.swift": "struct CountHomeView {}\n",
+            "VetInventory.xcodeproj/project.pbxproj": "// build graph\n",
+            "VetInventoryTests/InventoryRepositoryTests.swift": "final class InventoryRepositoryTests {}\n",
+        }
+        for relative, content in files.items():
+            (root / relative).write_text(content)
+
+        inventory = inventory_repository(root)
+        areas = dict(inventory.high_level_areas)
+
+        self.assertIn("AGENT.md", inventory.instruction_files)
+        self.assertIn("VetInventory.xcodeproj", inventory.root_markers)
+        self.assertNotIn(
+            "VetInventory.xcodeproj", inventory.representative_files
+        )
+        for area in (
+            "VetInventory/Application",
+            "VetInventory/Data",
+            "VetInventory/Domain",
+            "VetInventory/Features",
+            "VetInventoryTests",
+        ):
+            with self.subTest(area=area):
+                self.assertIn(area, areas)
+        self.assertIn(
+            "VetInventory/Features/CountHomeView.swift",
+            inventory.representative_files,
+        )
+        self.assertIn(
+            "VetInventoryTests/InventoryRepositoryTests.swift",
+            inventory.representative_files,
+        )
+        self.assertIn(
+            "Scripts/GenerateProject.swift", inventory.representative_files
+        )
+
+        prompt = render_retrofit_prompt(inventory)
+        self.assertIn('"VetInventory/Features": 1', prompt)
+        self.assertIn('"VetInventoryTests": 1', prompt)
+        self.assertIn('"VetInventory.xcodeproj"', prompt)
+        self.assertIn("structural inspection hints, not proposed ctx nodes", prompt)
+
     def test_prompt_supports_missing_root_with_protected_child(self) -> None:
         root = self.base / "partial-context"
         root.mkdir()

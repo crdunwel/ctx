@@ -14,8 +14,10 @@ node:
     meaning from version-controlled semantic context nodes.
 
 artifacts:
+  - path: AGENTS.md
+    role: Authoritative product architecture, behavioral contracts, safeguards, and verification expectations.
   - path: README.md
-    role: Public quickstart, preview status, supported workflow, trust boundary, and data-flow disclosure.
+    role: Public model-free quickstart, preview status, supported workflow, hook-surface guidance, trust boundary, and data-flow disclosure.
   - path: LICENSE
     role: Apache-2.0 terms governing public use, modification, and distribution.
   - path: SECURITY.md
@@ -34,66 +36,54 @@ artifacts:
     role: Typed manifest parsing and structural schema diagnostics.
   - path: src/ctx/models.py
     role: Immutable manifest records and canonical modeled serialization.
-  - path: src/ctx/discovery.py
-    role: Filesystem project discovery, semantic ancestry, and node URI assignment.
   - path: src/ctx/validation.py
     role: Project-wide deterministic validation and filesystem safety checks.
   - path: src/ctx/retrofit.py
-    role: Bounded repository inventory and standalone agent retrofit guidance.
+    role: Bounded hierarchical repository inventory, balanced evidence sampling, and standalone agent retrofit guidance.
   - path: src/ctx/retrofit_agent.py
-    role: Guarded Codex proposal adapter, isolated runtime state, filtered snapshots, reusable evidence-bound plans, anchored publication, and rollback.
-  - path: src/ctx/registry.py
-    role: Atomic disposable project registry with collision-safe registration and aliases.
+    role: Guarded Codex proposal adapter, filtered snapshots, structured coverage and conflict review, evidence-bound plans, anchored publication, and rollback.
   - path: src/ctx/universe.py
-    role: Registered project scanning, exact resolution, and deterministic lexical search ranking.
+    role: Policy-gated registered project resolution and coherent lexical ranking with explicit match evidence.
   - path: src/ctx/hydration.py
-    role: Progressive local and explicitly external context packet construction with URI-level deduplication, budgets, and safety warnings.
-  - path: src/ctx/graph.py
-    role: Bounded explicit-link traversal with cycle-safe visited tracking.
+    role: Progressive intent-bound local and external context traversal with policy gates, budgets, deduplication, and safety warnings.
   - path: src/ctx/freshness.py
-    role: Nearest-node ownership, anchored source hashing, canonical lock serialization, and freshness status.
+    role: Nearest-node ownership, reusable review routing, anchored source hashing, canonical lock serialization, and freshness status.
   - path: src/ctx/reconciliation.py
-    role: Guarded stale-context review, affected-manifest updates or acknowledgements, validation, sealing, and rollback.
+    role: Scoped stale-context review over affected and linked evidence, manifest updates or acknowledgements, validation, sealing, and rollback.
   - path: src/ctx/runs.py
     role: Transient immutable task baselines, fingerprint-bound acknowledgements, continuation state, and completion evidence under CTX_HOME.
   - path: src/ctx/codex_hooks.py
     role: Codex UserPromptSubmit hydration and single-continuation Stop reconciliation adapters.
   - path: src/ctx/integration.py
-    role: Create-only installer for canonical project or user Codex hook definitions.
-  - path: src/ctx/codex_cli.py
-    role: Shared fail-closed Codex executable discovery through an explicit override, shell PATH, or the standard macOS ChatGPT application bundle.
+    role: Create-only installer and read-only diagnostics for canonical project or user Codex hook definitions, including duplicate-scope avoidance.
   - path: src/ctx/lifecycle.py
-    role: Transaction boundary joining successful retrofit publication, initial freshness, and registration.
+    role: Transaction boundary joining retrofit publication, initial or reviewed-lock freshness, hooks, registration, and rollback.
   - path: docs/CLI.md
     role: Canonical two-word user command contract, compatibility policy, outputs, and exit semantics.
-  - path: tests/test_cli.py
-    role: Black-box acceptance coverage for the local foundation.
   - path: tests/test_retrofit.py
     role: Read-only, bounded, ignored-path, adversarial, and agent-prompt retrofit coverage.
   - path: tests/test_retrofit_run.py
     role: Black-box coverage for guarded agent invocation, exact dry-run plan reuse, transaction rollback, registration, and initial locks.
+  - path: tests/test_retrofit_review_cli.py
+    role: Black-box coverage for mandatory dry-run review of fresh graphs and missing-manifest-only proposals.
   - path: tests/test_retrofit_inspection.py
     role: Bounded corpus, fair media sampling, duplicate suppression, catalog, and full-fingerprint retrofit snapshot coverage.
   - path: tests/test_product_cli.py
     role: Product-level coverage for help, direct commands, registry, resolution, hydration, and status.
   - path: tests/test_demo.py
     role: Black-box proof that the bundled sample is create-only, strictly valid, fresh, progressively hydratable, and hook-reconciled.
-  - path: tests/test_freshness_artifact_ownership.py
-    role: Regression coverage proving declared cross-scope artifacts participate in every declaring node's freshness.
+  - path: tests/test_documentation.py
+    role: Regression coverage for the model-free first-value path and accurate Codex CLI, desktop, slash-command, and hook-scope claims.
+  - path: tests/test_hook_diagnostics.py
+    role: Filesystem-safety and duplicate-scope coverage for read-only project and user Codex hook diagnostics.
   - path: tests/test_item_artifact_evidence.py
     role: End-to-end evidence mapping coverage for exact hydration, compact ancestry, human display, freshness, and reconciliation inspection.
   - path: tests/test_reconcile.py
     role: End-to-end coverage for acknowledgement, manifest update, strict validation, lock refresh, and rollback.
-  - path: tests/test_reconcile_runtime_state.py
-    role: Regression coverage keeping Codex SQLite runtime state private to the guarded reconciliation run.
   - path: tests/test_runs.py
     role: Immutable-baseline, concurrent-hook, acknowledgement-fingerprint, race, secret-persistence, and run-storage safety regressions.
   - path: tests/test_hooks.py
     role: End-to-end Codex prompt/Stop lifecycle coverage including hydration, one continuation, selective completion, and invalid-context repair.
-  - path: tests/test_integration.py
-    role: Create-only and symlink-safe Codex hook installation coverage.
-  - path: tests/test_codex_cli.py
-    role: Precedence and fail-closed regression coverage for shared Codex executable discovery.
   - path: tests/test_freshness_subset.py
     role: Regression coverage proving run completion refreshes reviewed lock entries without blessing unrelated stale nodes.
 
@@ -109,15 +99,16 @@ items:
     kind: invariant
     title: Agent-assisted source processing is explicit
     summary: >
-      Automated retrofit and reconciliation may expose every eligible,
-      nonignored regular file in their filtered snapshot to the configured
-      model provider. Path-based exclusions are not content-secret detection;
-      sensitive files must be excluded, model-free prompt modes remain
-      available, and generated manifest text must be reviewed before commit.
+      Automated retrofit fingerprints every eligible nonignored regular file
+      and exposes a bounded balanced corpus to the configured model provider.
+      Reconciliation retains the full fingerprint but exposes source content
+      only from affected ownership, declared or linked evidence, and governing
+      instructions. Path exclusions are not secret detection; sensitive files
+      must be excluded, model-free prompt modes remain available, and generated
+      manifest text must be reviewed before commit.
     artifacts:
       - README.md
       - SECURITY.md
-      - src/ctx/cli.py
       - src/ctx/retrofit_agent.py
       - src/ctx/reconciliation.py
 
@@ -135,6 +126,21 @@ items:
       Context URIs are built from stable project, ancestor-node, and item IDs
       rather than physical directory names.
 
+  - id: explicit-auditable-context-retrieval
+    kind: invariant
+    title: Context traversal requires explicit auditable intent
+    summary: >
+      Search ranks coherent same-field matches and reports why they matched.
+      External context is read only from a registered checkout after its reuse
+      policy is enforced. Task hydration expands only an exact URI, a named
+      external project with one strong scope match, or a unique explicit node
+      or item on the active local routing frontier; weak or tied matches remain
+      dormant and emit a warning instead of silently widening context.
+    artifacts:
+      - src/ctx/universe.py
+      - src/ctx/hydration.py
+      - tests/test_product_cli.py
+
   - id: item-artifacts-route-evidence
     kind: decision
     title: Durable items cite manifest-native source evidence
@@ -144,14 +150,9 @@ items:
       from a durable claim to its authoritative implementation evidence.
     artifacts:
       - src/ctx/models.py
-      - src/ctx/schema.py
       - src/ctx/validation.py
       - src/ctx/hydration.py
       - src/ctx/freshness.py
-      - src/ctx/reconciliation.py
-      - src/ctx/retrofit.py
-      - tests/test_cli.py
-      - tests/test_freshness_artifact_ownership.py
       - tests/test_item_artifact_evidence.py
     reason: >
       Keeping evidence links in version-controlled manifests avoids adding
@@ -210,18 +211,17 @@ items:
     title: Default commands to the current project
     summary: >
       Common workflows use two-word commands such as ctx demo, ctx retrofit,
-      ctx hydrate, ctx show, ctx status, and ctx reconcile; paths and options
-      refine complex cases instead of being required for ordinary use. A
-      successful bare retrofit also installs create-only project Codex hooks,
-      initializes freshness, and registers the checkout, with --no-hooks as
-      the explicit agent-neutral opt-out.
+      ctx hydrate, ctx status, and ctx reconcile. Bare retrofit installs
+      create-only project hooks or reuses an exact canonical user-wide hook,
+      initializes freshness, and registers the checkout; --no-hooks is the
+      agent-neutral opt-out. The explicit ctx retrofit review form forces a
+      dry-run for a fresh graph scope audit, while an already-fresh no-op prints
+      copyable status, doctor, hydration, and review commands.
     artifacts:
       - src/ctx/cli.py
-      - src/ctx/demo.py
       - src/ctx/lifecycle.py
-      - src/ctx/integration.py
-      - tests/test_demo.py
       - tests/test_retrofit_run.py
+      - tests/test_retrofit_review_cli.py
     reason: >
       The command should make durable context easier to use than authoring or
       locating context files manually.
@@ -255,7 +255,9 @@ items:
     title: Deterministic freshness evidence
     summary: >
       Each semantic node hashes its nearest-owned eligible source records and
-      canonical manifest data into the generated root lock.
+      canonical manifest data into the generated root lock. A fresh-graph
+      retrofit review may replace only the exact lock it inspected and restores
+      that prior lock if a later lifecycle step fails.
     artifacts:
       - src/ctx/freshness.py
       - src/ctx/reconciliation.py
@@ -277,21 +279,16 @@ items:
     kind: decision
     title: Codex hooks hydrate and reconcile one immutable task run
     summary: >
-      Guarded bare retrofit installs reviewed project hooks by default. The
-      Codex UserPromptSubmit hook captures one pre-edit run baseline and injects
-      progressive hydration; the paired Stop hook either completes reviewed
-      changes or continues that exact run once with deterministic inspect,
-      acknowledge, validate, and complete commands.
+      UserPromptSubmit captures an immutable pre-edit baseline and injects
+      scoped hydration; Stop continues that run at most once for review. Bare
+      retrofit enables one canonical hook scope and reuses user-wide hooks to
+      avoid duplicates. Doctor reports configured overlap without inferring
+      trust, while explicit hydration remains portable.
     artifacts:
       - src/ctx/runs.py
       - src/ctx/codex_hooks.py
       - src/ctx/integration.py
-      - src/ctx/lifecycle.py
-      - src/ctx/cli.py
-      - tests/test_runs.py
       - tests/test_hooks.py
-      - tests/test_integration.py
-      - tests/test_retrofit_run.py
     reason: >
       Stable task boundaries make context maintenance timely without a watcher
       or per-save model call, while optional host adapters preserve the
@@ -318,20 +315,17 @@ items:
     kind: invariant
     title: Agent automation returns constrained proposals
     summary: >
-      Automated retrofit and reconciliation expose filtered read-only snapshots,
-      accept schema-bounded proposals, apply only allowlisted context paths, and
-      strictly validate before publication. Dry-run plans are evidence-bound and
-      apply without another agent. Successful retrofit treats new manifests,
-      project hooks, the initial lock, and registration as one rollback-safe
-      lifecycle and refuses a changed project.
+      Automation uses filtered read-only snapshots and a provider-compatible
+      structural schema; local parsing enforces bounds, uniqueness, paths, and
+      evidence. Reviews emit bounded stage and heartbeat progress. Every area
+      disposition and material conflict blocks unresolved publication;
+      evidence-bound plans create only missing manifests under one race-checked,
+      rollback-safe lifecycle.
     artifacts:
       - src/ctx/retrofit_agent.py
       - src/ctx/reconciliation.py
-      - src/ctx/codex_cli.py
       - src/ctx/lifecycle.py
-      - src/ctx/integration.py
-      - tests/test_codex_cli.py
       - tests/test_retrofit_inspection.py
       - tests/test_retrofit_run.py
+      - tests/test_retrofit_review_cli.py
       - tests/test_reconcile.py
-      - tests/test_reconcile_runtime_state.py

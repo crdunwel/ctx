@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, replace
@@ -18,11 +19,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from .codex_cli import find_codex_executable
-from .diagnostics import CtxError, UnsafePathError
+from .diagnostics import CtxError, NotFoundError, UnsafePathError
+from .freshness import project_status, read_lock_bytes_no_follow
 from .paths import is_within, require_safe_context_file
 from .retrofit import (
     HARD_EXCLUDED_DIRECTORIES,
     RetrofitInventory,
+    _hierarchical_area_paths,
+    _is_test_path,
     _open_child_directory_no_follow,
     _open_directory_no_follow,
     inventory_evidence_reasons,
@@ -37,8 +41,16 @@ from .yamlio import MAX_MANIFEST_BYTES, load_yaml
 
 MAX_AGENT_OUTPUT_BYTES = 1_048_576
 MAX_AGENT_SECONDS = 1_800
+AGENT_HEARTBEAT_SECONDS = 10
+MAX_AGENT_ERROR_DETAIL_CHARACTERS = 2_000
 MAX_PROPOSED_MANIFESTS = 64
 MAX_SUMMARY_CHARACTERS = 4_000
+MAX_COVERAGE_AREAS = 1_024
+MAX_COVERAGE_EVIDENCE = 64
+MAX_CONFLICTS = 64
+MAX_CONFLICT_EVIDENCE = 64
+MAX_REVIEW_EVIDENCE_REFERENCES = 4_096
+MAX_REVIEW_SUMMARY_CHARACTERS = 1_000
 MAX_SNAPSHOT_FILES = 50_000
 MAX_SNAPSHOT_BYTES = 268_435_456
 MAX_INSPECTION_BYTES = 67_108_864
@@ -61,7 +73,7 @@ MAX_INSPECTION_REFERENCE_PAIR_ATTEMPTS = 50_000
 MAX_INSPECTION_REFERENCE_FIELD_VALUES = 4_096
 MAX_INSPECTION_CATALOG_BYTES = 2_097_152
 MAX_RETROFIT_PLAN_BYTES = 2_097_152
-RETROFIT_PLAN_SCHEMA = "ctx-retrofit-plan/v1"
+RETROFIT_PLAN_SCHEMA = "ctx-retrofit-plan/v2"
 
 INSPECTION_CATALOG_PATH = ".ctx-retrofit-evidence.json"
 INSPECTION_PREVIEW_DIRECTORY = ".ctx-retrofit-previews"
@@ -194,8 +206,68 @@ _OUTPUT_SCHEMA: dict[str, Any] = {
             },
         },
         "summary": {"type": "string"},
+        "coverage": {
+            "type": "array",
+            "maxItems": MAX_COVERAGE_AREAS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "area": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": ["node", "ancestor-covered", "excluded", "unresolved"],
+                    },
+                    "scope": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "maxItems": MAX_COVERAGE_EVIDENCE,
+                        "items": {"type": "string"},
+                    },
+                    "summary": {"type": "string"},
+                },
+                "required": [
+                    "area",
+                    "disposition",
+                    "scope",
+                    "evidence",
+                    "summary",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "conflicts": {
+            "type": "array",
+            "maxItems": MAX_CONFLICTS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["resolved", "review-required"],
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_CONFLICT_EVIDENCE,
+                        "items": {"type": "string"},
+                    },
+                    "summary": {"type": "string"},
+                },
+                "required": ["id", "status", "evidence", "summary"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["manifests", "summary"],
+    "required": ["manifests", "summary", "coverage", "conflicts"],
     "additionalProperties": False,
 }
 
@@ -211,6 +283,23 @@ class ProposedManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class CoverageDisposition:
+    area: str
+    disposition: str
+    scope: str | None
+    evidence: tuple[str, ...]
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetrofitConflict:
+    id: str
+    status: str
+    evidence: tuple[str, ...]
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
 class RetrofitRunResult:
     root: Path
     validation: ValidationResult
@@ -219,6 +308,8 @@ class RetrofitRunResult:
     agent_summary: str
     finalization: object | None = None
     plan_id: str | None = None
+    coverage: tuple[CoverageDisposition, ...] = ()
+    conflicts: tuple[RetrofitConflict, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +325,7 @@ class InspectionSnapshot:
     elided_files: int
     copied_paths: tuple[str, ...]
     elided_paths: tuple[str, ...]
+    preview_paths: tuple[str, ...] = ()
     catalog_path: str = INSPECTION_CATALOG_PATH
 
 
@@ -268,6 +360,8 @@ class _RetrofitPlan:
     evidence_fingerprint: str
     manifests: list[dict[str, Any]]
     summary: str
+    coverage: tuple[CoverageDisposition, ...]
+    conflicts: tuple[RetrofitConflict, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +376,30 @@ class _CreatedManifest:
     size: int
     modified_ns: int
     context_directory_created: bool
+
+
+def _review_inventory_areas(inventory: RetrofitInventory) -> tuple[str, ...]:
+    """Return the complete bounded source-area vocabulary for semantic review."""
+
+    areas: set[str] = set()
+    for relative in inventory.eligible_files:
+        directories = PurePosixPath(relative).parts[:-1]
+        if not directories:
+            areas.add(".")
+        else:
+            areas.add(directories[0])
+            if len(directories) >= 2 and not directories[0].casefold().endswith(
+                (".xcodeproj", ".xcworkspace")
+            ):
+                areas.add(PurePosixPath(*directories[:2]).as_posix())
+        if len(areas) > MAX_COVERAGE_AREAS:
+            raise CtxError(
+                "retrofit.coverage-too-broad",
+                "bounded semantic coverage exceeds the automated area limit; "
+                "use `ctx retrofit prompt` for a manually scoped review",
+                exit_code=4,
+            )
+    return tuple(sorted(areas))
 
 
 def _automated_prompt(
@@ -341,6 +459,30 @@ lock file, or any other path. An empty list is correct when existing context is
 already sufficient. `summary` briefly explains the proposed semantic
 boundaries and any evidence limitation; do not include source or secret text.
 
+`coverage` is a transient semantic-review record and is never written into a
+context manifest. Return exactly one disposition for every bounded eligible
+source area in this JSON list (and no other area):
+{json.dumps(list(_review_inventory_areas(inventory)), ensure_ascii=True)}
+Use `node` when that area has its own proposed or existing manifest,
+`ancestor-covered` when an ancestor manifest intentionally provides sufficient
+local context, `excluded` when inspected evidence shows the structural area is
+not a semantic boundary, or `unresolved` when the nearest useful context scope
+cannot yet be decided safely. `scope` is the normalized proposed/existing
+`.ctx/context.yaml` path for `node` and `ancestor-covered`; it is null for
+`excluded` and `unresolved`. Parent and child inventory areas may overlap, so
+the summary must explain an ancestor or exclusion judgment rather than merely
+repeat the disposition. Cite at least one normalized project-relative evidence
+path from under each area. Do not use generated catalog or preview paths as
+evidence. An `unresolved` area deliberately prevents automatic publication or
+finalization while remaining visible in a saved dry-run plan.
+
+`conflicts` is also transient. Record each materially inconsistent contract,
+document, implementation, test, or context claim once. Use status `resolved`
+only when the inspected evidence supports the stated resolution; otherwise use
+`review-required`. Every conflict must cite at least one bounded project
+evidence path. A `review-required` conflict deliberately prevents automatic
+publication or finalization, while remaining visible in a saved dry-run plan.
+
 For this automated handoff, these read-only output rules replace the file-write,
 registration, reconciliation, and final-report steps above.
 """
@@ -386,11 +528,89 @@ def _root_identity(root: Path) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
+def _emit_agent_progress(
+    progress: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _stop_agent_process(process: subprocess.Popen[str]) -> None:
+    """Best-effort child cleanup for timeout and interruption paths."""
+
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait()
+    except OSError:
+        pass
+
+
+def _agent_error_detail(stream: Any) -> str:
+    """Return one bounded diagnostic line without replaying Codex's transcript."""
+
+    try:
+        stream.flush()
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - 65_536), os.SEEK_SET)
+        raw = stream.read()
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, bytes):
+        return ""
+    markers = ("error", "invalid_", "bad request", "status 4", "status 5")
+    for raw_line in reversed(raw.decode("utf-8", errors="replace").splitlines()):
+        line = " ".join(raw_line.split())
+        if line and any(marker in line.casefold() for marker in markers):
+            return line[-MAX_AGENT_ERROR_DETAIL_CHARACTERS:]
+    return ""
+
+
+def _wait_for_agent(
+    process: subprocess.Popen[str],
+    *,
+    progress: Callable[[str], None] | None,
+) -> int:
+    started = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - started
+        remaining = MAX_AGENT_SECONDS - elapsed
+        if remaining <= 0:
+            _stop_agent_process(process)
+            raise CtxError(
+                "retrofit.agent-timeout",
+                f"Codex did not finish within {MAX_AGENT_SECONDS} seconds; no "
+                "proposed manifests were applied",
+                exit_code=4,
+            )
+        try:
+            return process.wait(
+                timeout=min(float(AGENT_HEARTBEAT_SECONDS), remaining)
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_seconds = max(1, int(time.monotonic() - started))
+            _emit_agent_progress(
+                progress,
+                "Codex semantic review still running "
+                f"({elapsed_seconds}s elapsed; Ctrl-C to stop)",
+            )
+        except KeyboardInterrupt:
+            _stop_agent_process(process)
+            _emit_agent_progress(progress, "Codex semantic review interrupted; cleaning up")
+            raise
+
+
 def _run_codex(
     inventory: RetrofitInventory,
     work_directory: Path,
     snapshot_root: Path,
     snapshot: InspectionSnapshot,
+    *,
+    progress: Callable[[str], None] | None = None,
 ) -> Path:
     resolved_codex = find_codex_executable()
     if resolved_codex is None:
@@ -460,35 +680,37 @@ def _run_codex(
     environment["PATH"] = (
         python_bin if not inherited_path else os.pathsep.join((python_bin, inherited_path))
     )
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=snapshot_root,
-            env=environment,
-            input=_automated_prompt(inventory, snapshot_root, snapshot),
-            text=True,
-            stdout=subprocess.DEVNULL,
-            timeout=MAX_AGENT_SECONDS,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise CtxError(
-            "retrofit.agent-timeout",
-            f"Codex did not finish within {MAX_AGENT_SECONDS} seconds; no "
-            "proposed manifests were applied",
-            exit_code=4,
-        ) from exc
-    except OSError as exc:
+    prompt = _automated_prompt(inventory, snapshot_root, snapshot)
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as prompt_stream, tempfile.TemporaryFile(
+        mode="w+b"
+    ) as error_stream:
+        prompt_stream.write(prompt)
+        prompt_stream.seek(0)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=snapshot_root,
+                env=environment,
+                stdin=prompt_stream,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=error_stream,
+            )
+        except OSError as exc:
+            raise CtxError(
+                "retrofit.agent-failed",
+                f"could not start the Codex agent: {exc}",
+                exit_code=4,
+            ) from exc
+
+        returncode = _wait_for_agent(process, progress=progress)
+        detail = _agent_error_detail(error_stream)
+    if returncode != 0:
+        detail_suffix = f"; Codex detail: {detail}" if detail else ""
         raise CtxError(
             "retrofit.agent-failed",
-            f"could not start the Codex agent: {exc}",
-            exit_code=4,
-        ) from exc
-    if completed.returncode != 0:
-        raise CtxError(
-            "retrofit.agent-failed",
-            f"Codex exited with status {completed.returncode}; no proposed "
-            "manifests were applied",
+            f"Codex exited with status {returncode}; no proposed manifests were applied"
+            f"{detail_suffix}",
             exit_code=4,
         )
     if not result_path.is_file() or result_path.is_symlink():
@@ -555,15 +777,21 @@ def _open_eligible_file(root_fd: int, raw_path: str) -> int:
         os.close(parent_fd)
 
 
+def _is_instruction_inspection_path(relative: str) -> bool:
+    pure = PurePosixPath(relative)
+    name = pure.name.casefold()
+    if name in _INSTRUCTION_FILE_NAMES:
+        return True
+    return relative.casefold() == ".github/copilot-instructions.md"
+
+
 def _is_mandatory_inspection_path(relative: str) -> bool:
     pure = PurePosixPath(relative)
     parts = tuple(part.casefold() for part in pure.parts)
     name = pure.name.casefold()
     if len(parts) >= 2 and parts[-2:] == (".ctx", "context.yaml"):
         return True
-    if name in _INSTRUCTION_FILE_NAMES:
-        return True
-    if relative.casefold() == ".github/copilot-instructions.md":
+    if _is_instruction_inspection_path(relative):
         return True
     if len(parts) != 1:
         return False
@@ -597,7 +825,7 @@ def _inspection_priority(relative: str, mandatory: bool) -> int:
         return 2
     if any(part in {"src", "app", "lib", "server", "client", "api"} for part in pure.parts):
         return 3
-    if any(part in {"test", "tests", "spec", "specs", "fixtures"} for part in pure.parts):
+    if _is_test_path(pure):
         return 4
     if any(part in {"docs", "doc", "examples", "example"} for part in pure.parts):
         return 5
@@ -610,16 +838,8 @@ def _inspection_priority(relative: str, mandatory: bool) -> int:
 
 def _inspection_bucket(relative: str) -> str:
     pure = PurePosixPath(relative)
-    if len(pure.parts) <= 1:
-        return "."
-    first = pure.parts[0]
-    if (
-        first.casefold()
-        in {"apps", "crates", "modules", "packages", "services", "workspaces"}
-        and len(pure.parts) >= 3
-    ):
-        return f"{first}/{pure.parts[1]}"
-    return first
+    areas = _hierarchical_area_paths(pure)
+    return areas[-1] if areas else "."
 
 
 def _inspection_kind(
@@ -820,6 +1040,44 @@ def _promote_required_records(
         if record.relative_path in required_paths and not record.mandatory
         else record
         for record in records
+    )
+
+
+def _select_inspection_records(
+    records: tuple[_EvidenceRecord, ...],
+    inspection_paths: frozenset[str] | None,
+    required_paths: frozenset[str],
+    mandatory_paths: frozenset[str] | None,
+) -> tuple[_EvidenceRecord, ...]:
+    if inspection_paths is None:
+        return records
+    if any(type(path) is not str for path in inspection_paths):
+        raise CtxError(
+            "retrofit.snapshot-incomplete",
+            "scoped inspection paths must be normalized project-relative strings",
+            exit_code=4,
+        )
+    available = {record.relative_path for record in records}
+    missing = sorted(inspection_paths - available)
+    if missing:
+        raise CtxError(
+            "retrofit.snapshot-incomplete",
+            f"scoped inspection evidence is not eligible for guarded inspection: "
+            f"{missing[0]}",
+            exit_code=4,
+        )
+    selected = inspection_paths | required_paths
+    return tuple(
+        record
+        for record in records
+        if record.relative_path in selected
+        or (
+            record.mandatory
+            and (
+                mandatory_paths is None
+                or record.relative_path in mandatory_paths
+            )
+        )
     )
 
 
@@ -1657,11 +1915,18 @@ def _build_filtered_snapshot(
     root_fd: int,
     snapshot_root: Path,
     *,
+    inspection_paths: frozenset[str] | None = None,
+    mandatory_paths: frozenset[str] | None = None,
     required_paths: frozenset[str] = frozenset(),
     verification_exclude_paths: frozenset[str] = frozenset(),
     manual_command: str = "ctx retrofit prompt",
 ) -> InspectionSnapshot:
-    """Build a bounded corpus while hashing every eligible source byte."""
+    """Build a bounded corpus while hashing every eligible source byte.
+
+    A scoped selection limits model-visible source while retaining mandatory
+    repository instructions, explicit required paths, the complete catalog,
+    and the full evidence fingerprint.
+    """
 
     original_records = _evidence_records(inventory, root_fd)
     records = _promote_required_records(original_records, required_paths)
@@ -1673,9 +1938,16 @@ def _build_filtered_snapshot(
             if record.relative_path not in verification_exclude_paths
         )
     )
-    plan = _plan_inspection(records, manual_command=manual_command)
-    relationships = _discover_media_relationships(root_fd, records, plan)
-    plan = _complete_relationship_samples(records, plan, relationships)
+    inspection_records = _select_inspection_records(
+        records, inspection_paths, required_paths, mandatory_paths
+    )
+    plan = _plan_inspection(inspection_records, manual_command=manual_command)
+    relationships = _discover_media_relationships(
+        root_fd, inspection_records, plan
+    )
+    plan = _complete_relationship_samples(
+        inspection_records, plan, relationships
+    )
     snapshot_root.mkdir(mode=0o700)
     snapshot_fd = _open_snapshot_directory(snapshot_root)
     if snapshot_fd is None:  # pragma: no cover - guarded callers are POSIX-only
@@ -1715,6 +1987,7 @@ def _build_filtered_snapshot(
     finally:
         os.close(snapshot_fd)
     copied_paths = tuple(record.relative_path for record in plan.copied)
+    preview_paths = tuple(record.relative_path for record in plan.previews)
     copied_set = set(copied_paths)
     elided_paths = tuple(
         record.relative_path
@@ -1731,6 +2004,7 @@ def _build_filtered_snapshot(
         elided_files=len(elided_paths),
         copied_paths=copied_paths,
         elided_paths=elided_paths,
+        preview_paths=preview_paths,
     )
 
 
@@ -1827,7 +2101,326 @@ def _materialize_validation_placeholders(
         os.close(snapshot_fd)
 
 
-def _read_agent_output(path: Path) -> tuple[list[dict[str, Any]], str]:
+def _materialize_validation_files(
+    root_fd: int,
+    snapshot_root: Path,
+    paths: frozenset[str],
+) -> None:
+    """Copy hidden source only after agent execution for strict validation."""
+
+    if not paths:
+        return
+    snapshot_fd = _open_snapshot_directory(snapshot_root)
+    if snapshot_fd is None:  # pragma: no cover - guarded callers are POSIX-only
+        raise CtxError(
+            "retrofit.platform-unsupported",
+            "guarded snapshots require no-follow directory descriptors",
+            exit_code=4,
+        )
+    try:
+        for relative in sorted(paths):
+            record = _read_evidence_record(root_fd, relative)
+            _copy_record(root_fd, snapshot_fd, record)
+    finally:
+        os.close(snapshot_fd)
+
+
+def _review_error(code: str, message: str) -> CtxError:
+    return CtxError(code, message, exit_code=1)
+
+
+def _bounded_review_text(value: object, field: str, *, code: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > MAX_REVIEW_SUMMARY_CHARACTERS
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
+    ):
+        raise _review_error(
+            code,
+            f"{field} must be non-empty, trimmed, bounded printable text",
+        )
+    return value
+
+
+def _normalized_review_path(value: object, field: str, *, code: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 4_096
+        or "\\" in value
+        or "\x00" in value
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
+    ):
+        raise _review_error(code, f"{field} contains an unsafe evidence path")
+    pure = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    parts = value.split("/")
+    if (
+        pure.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or pure.as_posix() != value
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(part.casefold().startswith(_INSPECTION_RESERVED_PREFIX) for part in parts)
+    ):
+        raise _review_error(code, f"{field} contains an unsafe evidence path")
+    return value
+
+
+def _normalized_review_area(
+    value: object,
+    *,
+    code: str,
+    allowed_areas: tuple[str, ...] | None,
+) -> str:
+    if type(value) is not str or not value or len(value) > 4_096 or "\x00" in value:
+        raise _review_error(code, "coverage area is not a bounded inventory label")
+    if allowed_areas is not None and value not in set(allowed_areas):
+        raise _review_error(code, f"coverage contains unknown area {value!r}")
+    return value
+
+
+def _normalized_review_scope(value: object, *, code: str) -> str | None:
+    if value is None:
+        return None
+    scope = _normalized_review_path(value, "coverage scope", code=code)
+    if tuple(scope.split("/")[-2:]) != (".ctx", "context.yaml"):
+        raise _review_error(
+            code,
+            "coverage scope must be a proposed or existing .ctx/context.yaml path",
+        )
+    return scope
+
+
+def _scope_area(scope: str) -> str:
+    parts = PurePosixPath(scope).parts[:-2]
+    return PurePosixPath(*parts).as_posix() if parts else "."
+
+
+def _evidence_is_under_area(path: str, area: str) -> bool:
+    parts = PurePosixPath(path).parts
+    if area == ".":
+        return len(parts) == 1
+    area_parts = PurePosixPath(area).parts
+    return len(parts) > len(area_parts) and parts[: len(area_parts)] == area_parts
+
+
+def _review_evidence(
+    value: object,
+    *,
+    field: str,
+    maximum: int,
+    code: str,
+    allowed_evidence: frozenset[str] | None,
+) -> tuple[str, ...]:
+    if type(value) is not list or len(value) > maximum:
+        raise _review_error(
+            code,
+            f"{field} must be a bounded list of project-relative evidence paths",
+        )
+    normalized: list[str] = []
+    for path in value:
+        if type(path) is not str or not path or len(path) > 4_096 or "\x00" in path:
+            raise _review_error(code, f"{field} contains an invalid inventory path")
+        if allowed_evidence is not None and path not in allowed_evidence:
+            raise _review_error(
+                code,
+                f"{field} references evidence outside the bounded inventory: {path!r}",
+            )
+        normalized.append(path)
+    normalized_tuple = tuple(normalized)
+    if len(set(normalized_tuple)) != len(normalized_tuple):
+        raise _review_error(code, f"{field} contains duplicate evidence paths")
+    return tuple(sorted(normalized_tuple))
+
+
+def _parse_review_envelope(
+    coverage_value: object,
+    conflicts_value: object,
+    *,
+    code: str,
+    allowed_areas: tuple[str, ...] | None = None,
+    allowed_evidence: frozenset[str] | None = None,
+    inspectable_evidence: frozenset[str] | None = None,
+    allowed_scopes: frozenset[str] | None = None,
+) -> tuple[tuple[CoverageDisposition, ...], tuple[RetrofitConflict, ...]]:
+    if type(coverage_value) is not list or len(coverage_value) > MAX_COVERAGE_AREAS:
+        raise _review_error(code, "coverage must be a bounded list of area dispositions")
+    coverage: list[CoverageDisposition] = []
+    seen_areas: set[str] = set()
+    evidence_references = 0
+    for item in coverage_value:
+        if (
+            type(item) is not dict
+            or set(item)
+            != {"area", "disposition", "scope", "evidence", "summary"}
+        ):
+            raise _review_error(
+                code,
+                "each coverage disposition requires exactly area, disposition, "
+                "scope, evidence, and summary",
+            )
+        area = _normalized_review_area(
+            item["area"], code=code, allowed_areas=allowed_areas
+        )
+        if area in seen_areas:
+            raise _review_error(code, f"coverage contains duplicate area {area}")
+        seen_areas.add(area)
+        disposition = item["disposition"]
+        if type(disposition) is not str or disposition not in {
+            "node",
+            "ancestor-covered",
+            "excluded",
+            "unresolved",
+        }:
+            raise _review_error(code, f"coverage area {area} has an invalid disposition")
+        scope = _normalized_review_scope(item["scope"], code=code)
+        if disposition in {"node", "ancestor-covered"}:
+            if scope is None:
+                raise _review_error(
+                    code,
+                    f"coverage area {area} requires a governing manifest scope",
+                )
+            if allowed_scopes is not None and scope not in allowed_scopes:
+                raise _review_error(
+                    code,
+                    f"coverage area {area} references a scope that is neither "
+                    f"existing nor proposed: {scope}",
+                )
+            governing_area = _scope_area(scope)
+            if disposition == "node" and governing_area != area:
+                raise _review_error(
+                    code,
+                    f"node coverage for {area} must use a manifest in that area",
+                )
+            if disposition == "ancestor-covered" and (
+                governing_area == area
+                or (
+                    governing_area != "."
+                    and not area.startswith(f"{governing_area}/")
+                )
+            ):
+                raise _review_error(
+                    code,
+                    f"ancestor coverage for {area} must use an ancestor manifest",
+                )
+        elif scope is not None:
+            raise _review_error(
+                code,
+                f"coverage area {area} must use null scope for disposition {disposition}",
+            )
+        evidence = _review_evidence(
+            item["evidence"],
+            field=f"coverage evidence for {area}",
+            maximum=MAX_COVERAGE_EVIDENCE,
+            code=code,
+            allowed_evidence=allowed_evidence,
+        )
+        evidence_references += len(evidence)
+        if any(not _evidence_is_under_area(path, area) for path in evidence):
+            raise _review_error(
+                code,
+                f"coverage evidence for {area} must map under that inventory area",
+            )
+        if not evidence:
+            raise _review_error(
+                code,
+                f"coverage area {area} requires representative evidence",
+            )
+        if (
+            disposition != "unresolved"
+            and inspectable_evidence is not None
+            and not set(evidence).intersection(inspectable_evidence)
+        ):
+            raise _review_error(
+                code,
+                f"coverage area {area} must cite at least one inspected path",
+            )
+        summary = _bounded_review_text(
+            item["summary"], f"coverage summary for {area}", code=code
+        )
+        coverage.append(CoverageDisposition(area, disposition, scope, evidence, summary))
+    if allowed_areas is not None:
+        if len(allowed_areas) > MAX_COVERAGE_AREAS:
+            raise _review_error(
+                code,
+                "bounded inventory contains too many semantic review areas",
+            )
+        expected = set(allowed_areas)
+        missing = sorted(expected - seen_areas)
+        extra = sorted(seen_areas - expected)
+        if missing or extra:
+            detail = f"missing {missing[0]}" if missing else f"unknown {extra[0]}"
+            raise _review_error(
+                code,
+                "coverage must contain exactly one disposition per bounded "
+                f"inventory area ({detail})",
+            )
+
+    if type(conflicts_value) is not list or len(conflicts_value) > MAX_CONFLICTS:
+        raise _review_error(code, "conflicts must be a bounded list")
+    conflicts: list[RetrofitConflict] = []
+    seen_conflicts: set[str] = set()
+    for item in conflicts_value:
+        if (
+            type(item) is not dict
+            or set(item) != {"id", "status", "evidence", "summary"}
+        ):
+            raise _review_error(
+                code,
+                "each conflict requires exactly id, status, evidence, and summary",
+            )
+        conflict_id = item["id"]
+        if type(conflict_id) is not str or re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?", conflict_id
+        ) is None:
+            raise _review_error(code, "conflict IDs must be bounded lowercase identities")
+        if conflict_id in seen_conflicts:
+            raise _review_error(code, f"conflicts contains duplicate ID {conflict_id}")
+        seen_conflicts.add(conflict_id)
+        status = item["status"]
+        if type(status) is not str or status not in {"resolved", "review-required"}:
+            raise _review_error(code, f"conflict {conflict_id} has an invalid status")
+        evidence = _review_evidence(
+            item["evidence"],
+            field=f"conflict evidence for {conflict_id}",
+            maximum=MAX_CONFLICT_EVIDENCE,
+            code=code,
+            allowed_evidence=allowed_evidence,
+        )
+        evidence_references += len(evidence)
+        if not evidence:
+            raise _review_error(code, f"conflict {conflict_id} requires evidence")
+        if inspectable_evidence is not None and not set(evidence).issubset(inspectable_evidence):
+            raise _review_error(
+                code,
+                f"conflict {conflict_id} cites evidence that was not inspected",
+            )
+        summary = _bounded_review_text(
+            item["summary"], f"conflict summary for {conflict_id}", code=code
+        )
+        conflicts.append(RetrofitConflict(conflict_id, status, evidence, summary))
+    if evidence_references > MAX_REVIEW_EVIDENCE_REFERENCES:
+        raise _review_error(code, "semantic review contains too many evidence references")
+    return (
+        tuple(sorted(coverage, key=lambda value: value.area)),
+        tuple(sorted(conflicts, key=lambda value: value.id)),
+    )
+
+
+def _read_agent_output(
+    path: Path,
+    inventory: RetrofitInventory,
+    snapshot: InspectionSnapshot,
+) -> tuple[
+    list[dict[str, Any]],
+    str,
+    tuple[CoverageDisposition, ...],
+    tuple[RetrofitConflict, ...],
+]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1875,10 +2468,11 @@ def _read_agent_output(path: Path) -> tuple[list[dict[str, Any]], str]:
             f"Codex returned invalid proposal JSON: {exc}",
             exit_code=1,
         ) from exc
-    if type(value) is not dict or set(value) != {"manifests", "summary"}:
+    required = {"manifests", "summary", "coverage", "conflicts"}
+    if type(value) is not dict or set(value) != required:
         raise CtxError(
             "retrofit.agent-output-invalid",
-            "Codex proposal must contain exactly manifests and summary",
+            "Codex proposal must contain exactly manifests, summary, coverage, and conflicts",
             exit_code=1,
         )
     manifests = value["manifests"]
@@ -1902,7 +2496,26 @@ def _read_agent_output(path: Path) -> tuple[list[dict[str, Any]], str]:
                 "each Codex manifest proposal requires exactly path and content",
                 exit_code=1,
             )
-    return manifests, summary
+    allowed_evidence = frozenset(_eligible_snapshot_paths(inventory))
+    inspectable_evidence = frozenset(snapshot.copied_paths) | frozenset(
+        snapshot.preview_paths
+    )
+    proposed_scopes = frozenset(
+        item["path"]
+        for item in manifests
+        if type(item.get("path")) is str
+        and tuple(item["path"].split("/")[-2:]) == (".ctx", "context.yaml")
+    )
+    coverage, conflicts = _parse_review_envelope(
+        value["coverage"],
+        value["conflicts"],
+        code="retrofit.agent-output-invalid",
+        allowed_areas=_review_inventory_areas(inventory),
+        allowed_evidence=allowed_evidence,
+        inspectable_evidence=inspectable_evidence,
+        allowed_scopes=proposed_scopes | frozenset(inventory.all_context_manifests),
+    )
+    return manifests, summary, coverage, conflicts
 
 
 def _canonical_plan_payload(
@@ -1911,6 +2524,8 @@ def _canonical_plan_payload(
     evidence_fingerprint: str,
     proposals: tuple[ProposedManifest, ...],
     summary: str,
+    coverage: tuple[CoverageDisposition, ...],
+    conflicts: tuple[RetrofitConflict, ...],
 ) -> dict[str, Any]:
     return {
         "schema": RETROFIT_PLAN_SCHEMA,
@@ -1925,6 +2540,25 @@ def _canonical_plan_payload(
             for proposal in sorted(proposals, key=lambda value: value.relative_path)
         ],
         "summary": summary,
+        "coverage": [
+            {
+                "area": item.area,
+                "disposition": item.disposition,
+                "scope": item.scope,
+                "evidence": list(item.evidence),
+                "summary": item.summary,
+            }
+            for item in coverage
+        ],
+        "conflicts": [
+            {
+                "id": item.id,
+                "status": item.status,
+                "evidence": list(item.evidence),
+                "summary": item.summary,
+            }
+            for item in conflicts
+        ],
     }
 
 
@@ -1976,6 +2610,8 @@ def _save_retrofit_plan(
     evidence_fingerprint: str,
     proposals: tuple[ProposedManifest, ...],
     summary: str,
+    coverage: tuple[CoverageDisposition, ...],
+    conflicts: tuple[RetrofitConflict, ...],
 ) -> str:
     payload = _canonical_plan_payload(
         root,
@@ -1983,6 +2619,8 @@ def _save_retrofit_plan(
         evidence_fingerprint,
         proposals,
         summary,
+        coverage,
+        conflicts,
     )
     canonical = _canonical_json(payload)
     if len(canonical) > MAX_RETROFIT_PLAN_BYTES:
@@ -2122,6 +2760,8 @@ def _load_retrofit_plan(plan_id: str) -> _RetrofitPlan:
         "evidence_fingerprint",
         "manifests",
         "summary",
+        "coverage",
+        "conflicts",
     }
     if type(value) is not dict or set(value) != required or value.get("schema") != RETROFIT_PLAN_SCHEMA:
         raise CtxError(
@@ -2134,6 +2774,8 @@ def _load_retrofit_plan(plan_id: str) -> _RetrofitPlan:
     fingerprint = value["evidence_fingerprint"]
     manifests = value["manifests"]
     summary = value["summary"]
+    coverage_raw = value["coverage"]
+    conflicts_raw = value["conflicts"]
     if (
         type(root_raw) is not str
         or not Path(root_raw).is_absolute()
@@ -2154,6 +2796,11 @@ def _load_retrofit_plan(plan_id: str) -> _RetrofitPlan:
             "saved retrofit plan contains invalid fields",
             exit_code=1,
         )
+    coverage, conflicts = _parse_review_envelope(
+        coverage_raw,
+        conflicts_raw,
+        code="retrofit.plan-invalid",
+    )
     canonical = _canonical_json(value)
     if hashlib.sha256(canonical).hexdigest() != plan_id:
         raise CtxError(
@@ -2168,6 +2815,8 @@ def _load_retrofit_plan(plan_id: str) -> _RetrofitPlan:
         fingerprint,
         manifests,
         summary,
+        coverage,
+        conflicts,
     )
 
 
@@ -2182,6 +2831,29 @@ def render_retrofit_plan(plan_id: str) -> str:
         "evidence_fingerprint": plan.evidence_fingerprint,
         "manifests": plan.manifests,
         "summary": plan.summary,
+        "coverage": [
+            {
+                "area": item.area,
+                "disposition": item.disposition,
+                "scope": item.scope,
+                "evidence": list(item.evidence),
+                "summary": item.summary,
+            }
+            for item in plan.coverage
+        ],
+        "conflicts": [
+            {
+                "id": item.id,
+                "status": item.status,
+                "evidence": list(item.evidence),
+                "summary": item.summary,
+            }
+            for item in plan.conflicts
+        ],
+        "review_required": any(
+            item.status == "review-required" for item in plan.conflicts
+        )
+        or any(item.disposition == "unresolved" for item in plan.coverage),
     }
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
 
@@ -2738,6 +3410,47 @@ def _validate_snapshot_proposals(
     return validate_project(snapshot_root, strict=True)
 
 
+def _fresh_lock_baseline(root: Path) -> bytes | None:
+    """Capture an exact pre-publication lock only from a fresh existing graph."""
+
+    try:
+        status = project_status(root)
+    except NotFoundError:
+        return None
+    if not status.fresh:
+        return None
+    path = status.lock_path
+    try:
+        content = read_lock_bytes_no_follow(path)
+    except CtxError:
+        raise
+    except OSError as exc:
+        raise CtxError(
+            "retrofit.lock-changed",
+            f"cannot capture the reviewed freshness lock: {exc}",
+            exit_code=4,
+        ) from exc
+    try:
+        verified_fresh = project_status(root).fresh
+        current_content = read_lock_bytes_no_follow(path)
+    except (CtxError, OSError) as exc:
+        raise CtxError(
+            "retrofit.lock-changed",
+            f"cannot verify the reviewed freshness lock: {exc}",
+            exit_code=4,
+        ) from exc
+    if (
+        not verified_fresh
+        or current_content != content
+    ):
+        raise CtxError(
+            "retrofit.lock-changed",
+            "the freshness lock changed while the reviewed baseline was captured",
+            exit_code=4,
+        )
+    return content
+
+
 def _apply_prepared_proposals(
     root: Path,
     original_identity: tuple[int, int],
@@ -2748,7 +3461,11 @@ def _apply_prepared_proposals(
     expected_evidence_fingerprint: str,
     *,
     plan_id: str | None = None,
+    coverage: tuple[CoverageDisposition, ...] = (),
+    conflicts: tuple[RetrofitConflict, ...] = (),
 ) -> RetrofitRunResult:
+    replace_fresh_lock = _fresh_lock_baseline(root)
+
     def require_unchanged(
         *,
         message: str,
@@ -2826,6 +3543,7 @@ def _apply_prepared_proposals(
                 ),
                 exclude_paths=excluded_proposals,
             )
+            _verify_created_locations(root_fd, proposals, created)
 
         try:
             if finalize is None:
@@ -2840,11 +3558,18 @@ def _apply_prepared_proposals(
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                accepts_lock_baseline = any(
+                    parameter.name == "replace_fresh_lock"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
                 if accepts_guard:
-                    finalization = finalize(
-                        root,
-                        verify_unchanged=verify_unchanged,
-                    )
+                    keyword_arguments: dict[str, Any] = {
+                        "verify_unchanged": verify_unchanged,
+                    }
+                    if accepts_lock_baseline:
+                        keyword_arguments["replace_fresh_lock"] = replace_fresh_lock
+                    finalization = finalize(root, **keyword_arguments)
                 else:
                     verify_unchanged()
                     finalization = finalize(root)
@@ -2861,6 +3586,8 @@ def _apply_prepared_proposals(
         summary,
         finalization,
         plan_id,
+        coverage,
+        conflicts,
     )
 
 
@@ -2903,6 +3630,82 @@ def _require_evidence_fingerprint(
         raise CtxError(code, message, exit_code=4)
 
 
+def _require_resolved_review(
+    coverage: tuple[CoverageDisposition, ...],
+    conflicts: tuple[RetrofitConflict, ...],
+    *,
+    plan_id: str | None = None,
+) -> None:
+    unresolved_areas = tuple(
+        item for item in coverage if item.disposition == "unresolved"
+    )
+    unresolved_conflicts = tuple(
+        conflict for conflict in conflicts if conflict.status == "review-required"
+    )
+    if not unresolved_areas and not unresolved_conflicts:
+        return
+    blockers = [f"area:{item.area}" for item in unresolved_areas]
+    blockers.extend(f"conflict:{item.id}" for item in unresolved_conflicts)
+    identities = ", ".join(blockers[:5])
+    if len(blockers) > 5:
+        identities += f", and {len(blockers) - 5} more"
+    review = (
+        f"; inspect with `ctx retrofit --show-plan {plan_id}`"
+        if plan_id is not None
+        else "; rerun with `ctx retrofit --dry-run` to save the review envelope"
+    )
+    raise CtxError(
+        "retrofit.review-required",
+        f"automatic retrofit publication is blocked by unresolved semantic review: "
+        f"{identities}{review}",
+        exit_code=1,
+    )
+
+
+def _review_display_summary(
+    summary: str,
+    coverage: tuple[CoverageDisposition, ...],
+    conflicts: tuple[RetrofitConflict, ...],
+) -> str:
+    incomplete = tuple(
+        item for item in coverage if item.disposition == "unresolved"
+    )
+    unresolved = tuple(
+        item for item in conflicts if item.status == "review-required"
+    )
+    notes: list[str] = []
+    if coverage:
+        dispositions = ", ".join(
+            f"{item.area}={item.disposition}" for item in coverage[:8]
+        )
+        if len(coverage) > 8:
+            dispositions += f", and {len(coverage) - 8} more"
+        notes.append(f"coverage dispositions {dispositions}")
+    if incomplete:
+        names = ", ".join(
+            item.area for item in incomplete[:8]
+        )
+        if len(incomplete) > 8:
+            names += f", and {len(incomplete) - 8} more"
+        notes.append(f"unresolved coverage {names}")
+    if conflicts:
+        statuses = ", ".join(
+            f"{item.id}={item.status}" for item in conflicts[:8]
+        )
+        if len(conflicts) > 8:
+            statuses += f", and {len(conflicts) - 8} more"
+        notes.append(f"conflict dispositions {statuses}")
+    if unresolved:
+        names = ", ".join(item.id for item in unresolved[:8])
+        if len(unresolved) > 8:
+            names += f", and {len(unresolved) - 8} more"
+        notes.append(f"review-required conflicts {names}")
+    if not notes:
+        return summary
+    review = "Semantic review: " + "; ".join(notes) + "."
+    return f"{summary.rstrip()} {review}".strip()
+
+
 def apply_retrofit_plan(
     plan_id: str,
     *,
@@ -2912,6 +3715,9 @@ def apply_retrofit_plan(
     """Apply the exact strict-valid proposal saved by a prior dry run."""
 
     plan = _load_retrofit_plan(plan_id)
+    _require_resolved_review(
+        plan.coverage, plan.conflicts, plan_id=plan.plan_id
+    )
     selected_path = plan.root if path is None else path
     try:
         inventory = inventory_repository(selected_path)
@@ -2978,6 +3784,8 @@ def apply_retrofit_plan(
                     plan.summary,
                     None,
                     plan.plan_id,
+                    plan.coverage,
+                    plan.conflicts,
                 )
             if _root_identity(inventory.root) != plan.root_identity:
                 raise CtxError(
@@ -2994,6 +3802,8 @@ def apply_retrofit_plan(
                 finalize,
                 plan.evidence_fingerprint,
                 plan_id=plan.plan_id,
+                coverage=plan.coverage,
+                conflicts=plan.conflicts,
             )
     finally:
         os.close(root_fd)
@@ -3005,9 +3815,11 @@ def run_agent_retrofit(
     dry_run: bool = False,
     finalize: Callable[..., object] | None = None,
     codex_executable: str = "codex",
+    progress: Callable[[str], None] | None = None,
 ) -> RetrofitRunResult:
     """Inspect read-only with Codex, then publish only strict-valid new manifests."""
 
+    _emit_agent_progress(progress, f"inventorying project at {path}")
     try:
         inventory = inventory_repository(path)
     except PermissionError as exc:
@@ -3042,6 +3854,14 @@ def run_agent_retrofit(
             inspection = _build_filtered_snapshot(
                 inventory, root_fd, snapshot_root
             )
+            inspected_count = len(inspection.copied_paths) + len(
+                inspection.preview_paths
+            )
+            _emit_agent_progress(
+                progress,
+                f"prepared bounded read-only snapshot ({inspected_count} inspected "
+                f"of {len(inventory.eligible_files)} eligible files)",
+            )
             evidence_fingerprint = inspection.evidence_fingerprint
             if codex_executable != "codex":
                 raise CtxError(
@@ -3049,13 +3869,32 @@ def run_agent_retrofit(
                     f"no guarded adapter is installed for agent {codex_executable!r}",
                     exit_code=1,
                 )
-            result_path = _run_codex(
-                inventory,
-                work_directory,
-                snapshot_root,
-                inspection,
+            _emit_agent_progress(
+                progress,
+                "starting Codex semantic review (this may take several minutes)",
             )
-            raw_items, summary = _read_agent_output(result_path)
+            if progress is None:
+                result_path = _run_codex(
+                    inventory,
+                    work_directory,
+                    snapshot_root,
+                    inspection,
+                )
+            else:
+                result_path = _run_codex(
+                    inventory,
+                    work_directory,
+                    snapshot_root,
+                    inspection,
+                    progress=progress,
+                )
+            _emit_agent_progress(
+                progress,
+                "Codex semantic review finished; validating the proposal",
+            )
+            raw_items, summary, coverage, conflicts = _read_agent_output(
+                result_path, inventory, inspection
+            )
             if _root_identity(inventory.root) != original_identity:
                 raise CtxError(
                     "retrofit.root-changed",
@@ -3094,16 +3933,21 @@ def run_agent_retrofit(
                         evidence_fingerprint,
                         proposals,
                         summary,
+                        coverage,
+                        conflicts,
                     )
                 return RetrofitRunResult(
                     inventory.root,
                     validation,
                     (),
                     tuple(proposal.destination for proposal in proposals),
-                    summary,
+                    _review_display_summary(summary, coverage, conflicts),
                     None,
                     plan_id,
+                    coverage,
+                    conflicts,
                 )
+            _require_resolved_review(coverage, conflicts)
             return _apply_prepared_proposals(
                 inventory.root,
                 original_identity,
@@ -3112,6 +3956,8 @@ def run_agent_retrofit(
                 summary,
                 finalize,
                 evidence_fingerprint,
+                coverage=coverage,
+                conflicts=conflicts,
             )
     finally:
         os.close(root_fd)

@@ -370,6 +370,16 @@ ctx status
 ctx reconcile
 ```
 
+`ctx reconcile` reports five stages on stderr: freshness, inventory, guarded
+Codex review, proposal validation, and publication. While Codex is working it
+prints an elapsed heartbeat every ten seconds, including a reminder that
+`Ctrl-C` stops the child safely without publishing a partial result. The raw
+provider transcript remains suppressed, and stdout is reserved for the final
+result. A correctable proposal defect is reported before one isolated correction
+review; if a proposal is still rejected, ctx explicitly reports that no project
+files changed and displays diagnostics against checkout paths rather than its
+temporary validation copy.
+
 ### Review operational guidance from a broader change
 
 ```bash

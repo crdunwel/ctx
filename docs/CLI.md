@@ -189,6 +189,16 @@ every currently affected node has been reviewed and no manifest edit is
 warranted. The reason is transient and never copied into the manifest or
 deterministic lock.
 
+The command reports five stages on stderr: freshness, inventory, guarded Codex
+review, proposal validation, and publication. During the model review, an
+elapsed heartbeat every ten seconds shows that the child is still running and
+reminds the developer that `Ctrl-C` stops it safely without publishing a
+partial result. Raw provider transcripts stay suppressed, and stdout remains
+reserved for the final result. Correctable local schema or item-evidence defects
+trigger one visible isolated correction review. A proposal that remains invalid
+is reported as rejected with no project files changed, and its diagnostics use
+checkout paths instead of the temporary validation workspace.
+
 `ctx begin` captures an immutable pre-edit baseline and returns a stable run ID.
 `--session` and `--turn` associate that run with an agent task without changing
 the baseline. The run-scoped reconciliation commands require the original

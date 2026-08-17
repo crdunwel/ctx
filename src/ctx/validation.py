@@ -8,7 +8,7 @@ from typing import Iterable
 
 from .diagnostics import CtxError, Diagnostic, UnsafePathError
 from .discovery import assign_node_uris, find_project_root, scan_project_documents
-from .models import LoadedNode, ManifestDocument, Project
+from .models import LoadedNode, Manifest, ManifestDocument, Project
 from .paths import (
     has_exact_case,
     is_secret_path,
@@ -244,23 +244,84 @@ def _validate_artifacts(
             )
     for item_index, item in enumerate(manifest.items):
         for artifact_index, artifact_path in enumerate(item.artifacts):
-            field = f"items[{item_index}].artifacts[{artifact_index}]"
             try:
-                candidate = resolved_project_path(
-                    document.node_dir, artifact_path, root, require_exists=False
+                resolved_project_path(
+                    document.node_dir,
+                    artifact_path,
+                    root,
+                    require_exists=False,
                 )
             except UnsafePathError as exc:
-                _error(diagnostics, exc.code, exc.message, document, field)
-                continue
-            if candidate not in declared:
                 _error(
                     diagnostics,
-                    "item.artifact-undeclared",
-                    f"item artifact must also have a top-level artifact role: {artifact_path}",
+                    exc.code,
+                    exc.message,
                     document,
-                    field,
-                    candidate,
+                    f"items[{item_index}].artifacts[{artifact_index}]",
                 )
+    for item_index, artifact_index, artifact_path, candidate in (
+        find_undeclared_item_artifacts(
+            manifest,
+            document.node_dir,
+            root,
+            declared=declared,
+        )
+    ):
+        _error(
+            diagnostics,
+            "item.artifact-undeclared",
+            f"item artifact must also have a top-level artifact role: {artifact_path}",
+            document,
+            f"items[{item_index}].artifacts[{artifact_index}]",
+            candidate,
+        )
+
+
+def find_undeclared_item_artifacts(
+    manifest: Manifest,
+    node_dir: Path,
+    root: Path,
+    *,
+    declared: Iterable[Path] | None = None,
+) -> tuple[tuple[int, int, str, Path], ...]:
+    """Return safe item evidence paths lacking a top-level artifact role."""
+
+    declared_paths: set[Path]
+    if declared is None:
+        declared_paths = set()
+        for artifact in manifest.artifacts:
+            try:
+                declared_paths.add(
+                    resolved_project_path(
+                        node_dir,
+                        artifact.path,
+                        root,
+                        require_exists=False,
+                    )
+                )
+            except UnsafePathError:
+                # The full validator reports unsafe artifact paths separately.
+                continue
+    else:
+        declared_paths = set(declared)
+
+    missing: list[tuple[int, int, str, Path]] = []
+    for item_index, item in enumerate(manifest.items):
+        for artifact_index, artifact_path in enumerate(item.artifacts):
+            try:
+                candidate = resolved_project_path(
+                    node_dir,
+                    artifact_path,
+                    root,
+                    require_exists=False,
+                )
+            except UnsafePathError:
+                # Unsafe paths remain fatal whole-graph diagnostics, not
+                # correctable model-output omissions.
+                continue
+            if candidate not in declared_paths:
+                missing.append((item_index, artifact_index, artifact_path, candidate))
+    return tuple(missing)
 
 
 def _broad_tracking_pattern(value: str, document: ManifestDocument, root: Path) -> bool:

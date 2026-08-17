@@ -8,7 +8,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from ctx import reconciliation
 from ctx.cli import _safe_display
 from ctx.freshness import seal_freshness
 from ctx.retrofit_agent import MAX_AGENT_OUTPUT_BYTES, MAX_PROPOSED_MANIFESTS
@@ -205,6 +207,49 @@ graph_invalid_manifest = valid_manifest + """artifacts:
   - path: missing.py
     role: This source path does not exist.
 """
+top_level_item_evidence = """artifacts:
+  - path: tests/researchCoverage.test.ts
+    role: Verifies exhaustive multi-signal source-ledger presentation.
+  - path: tests/mapLayers.test.ts
+    role: Verifies the allowlisted mapping from evidence types to map groups.
+  - path: tests/affordableHousing.test.ts
+    role: Verifies source wording and candidate-match limitations.
+"""
+item_evidence_manifest = """version: 1
+project:
+  id: reconcile-project
+  name: Reconcile Project
+  aliases: []
+node:
+  id: root
+  name: Reconcile Project
+  summary: Current source now establishes durable browser evidence rules.
+""" + top_level_item_evidence + """items:
+  - id: unavailable-states-remain-visible
+    kind: invariant
+    title: Unavailable states remain visible
+    summary: Coverage signals remain distinct and visible.
+    artifacts: [tests/researchCoverage.test.ts]
+  - id: research-coverage-is-exhaustive
+    kind: invariant
+    title: Research coverage is exhaustive
+    summary: Every source-ledger row maps to one visible domain.
+    artifacts: [tests/researchCoverage.test.ts]
+  - id: lazy-map-is-a-screening-projection
+    kind: pattern
+    title: Property map is a screening projection
+    summary: Only allowlisted layer groups may be requested.
+    artifacts: [tests/mapLayers.test.ts]
+  - id: specialized-families-retain-source-meaning
+    kind: invariant
+    title: Specialized evidence retains source meaning
+    summary: Affordable-housing evidence retains source limitations.
+    artifacts: [tests/affordableHousing.test.ts]
+"""
+undeclared_item_evidence_manifest = item_evidence_manifest.replace(
+    top_level_item_evidence,
+    "",
+)
 adapter_prose_manifest = valid_manifest.replace(
     "Current source now establishes a durable bounded operating rule.",
     "Durable prose preserves the `.ctx-retrofit` adapter name as project context.",
@@ -250,6 +295,21 @@ elif mode == "graph-invalid":
         }}],
         "acknowledgements": [],
         "summary": "Graph-invalid result must not be retried.",
+    }}
+elif mode in {{
+    "undeclared-item-artifacts-once",
+    "undeclared-item-artifacts-always",
+}}:
+    invalid = attempt == 1 or mode == "undeclared-item-artifacts-always"
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": (
+                undeclared_item_evidence_manifest if invalid else item_evidence_manifest
+            ),
+        }}],
+        "acknowledgements": [],
+        "summary": "Proposed durable browser evidence rules.",
     }}
 elif mode == "valid-preserve-adapter-prose":
     payload = {{
@@ -404,6 +464,16 @@ if mode == "provider-failure":
             for line in record.read_text(encoding="utf-8").splitlines()
         ]
 
+    def create_item_evidence_files(self) -> None:
+        tests = self.project / "tests"
+        tests.mkdir(exist_ok=True)
+        for name in (
+            "researchCoverage.test.ts",
+            "mapLayers.test.ts",
+            "affordableHousing.test.ts",
+        ):
+            (tests / name).write_text("export {};\n", encoding="utf-8")
+
     def test_local_manifest_schema_error_gets_one_isolated_correction(self) -> None:
         manifest = self.project / ".ctx" / "context.yaml"
         lock = self.project / ".ctx" / "lock.json"
@@ -461,7 +531,7 @@ if mode == "provider-failure":
 
         first_prompt = str(invocations[0]["prompt"])
         correction_prompt = str(invocations[1]["prompt"])
-        marker = "# One-time bounded schema correction"
+        marker = "# One-time bounded proposal correction"
         self.assertNotIn(marker, first_prompt)
         self.assertIn(marker, correction_prompt)
         self.assertIn(
@@ -485,7 +555,7 @@ if mode == "provider-failure":
             first_prompt,
         )
         self.assertIn("untrusted model output", correction_prompt)
-        self.assertIn("schema-validation failure", correction_prompt)
+        self.assertIn("local proposal-validation failure", correction_prompt)
         self.assertIn("500-character limit", correction_prompt)
         self.assertIn("same read-only snapshot", correction_prompt)
         self.assertNotIn("FIRST_INVALID_OUTPUT_CANARY_36ca42", correction_prompt)
@@ -508,6 +578,75 @@ if mode == "provider-failure":
         status = self.run_ctx("status", "--check", "--json")
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertTrue(json.loads(status.stdout)["fresh"])
+
+    def test_undeclared_item_artifacts_get_one_visible_correction(self) -> None:
+        self.create_item_evidence_files()
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment["FAKE_RECONCILE_CORRECTION_MODE"] = (
+            "undeclared-item-artifacts-once"
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [item["attempt"] for item in self.read_correction_invocations(record)],
+            [1, 2],
+        )
+        self.assertIn(
+            "ctx reconcile: [4/5] proposal rejected before publication "
+            "(proposed item artifact is missing a top-level artifact role)",
+            result.stderr,
+        )
+        updated = (self.project / ".ctx" / "context.yaml").read_text(
+            encoding="utf-8"
+        )
+        for path in (
+            "tests/researchCoverage.test.ts",
+            "tests/mapLayers.test.ts",
+            "tests/affordableHousing.test.ts",
+        ):
+            self.assertIn(f"  - path: {path}\n", updated)
+        correction_prompt = str(self.read_correction_invocations(record)[1]["prompt"])
+        self.assertIn(
+            "subset of the same manifest's top-level `artifacts[].path` set",
+            correction_prompt,
+        )
+        status = self.run_ctx("status", "--check", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
+    def test_repeated_undeclared_item_artifacts_fail_visibly_without_writes(
+        self,
+    ) -> None:
+        self.create_item_evidence_files()
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment["FAKE_RECONCILE_CORRECTION_MODE"] = (
+            "undeclared-item-artifacts-always"
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            [item["attempt"] for item in self.read_correction_invocations(record)],
+            [1, 2],
+        )
+        self.assertIn(
+            "ctx reconcile: [4/5] corrected proposal rejected; no project files changed",
+            result.stderr,
+        )
+        self.assertIn(
+            "after one correction attempt; no project files changed",
+            result.stderr,
+        )
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        self.assertEqual(lock.read_bytes(), original_lock)
 
     def test_second_local_manifest_schema_error_fails_without_writes(self) -> None:
         manifest = self.project / ".ctx" / "context.yaml"
@@ -798,6 +937,62 @@ if mode == "provider-failure":
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertTrue(json.loads(status.stdout)["fresh"])
 
+    def test_reconcile_reports_stages_on_stderr_and_keeps_stdout_clean(self) -> None:
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, environment = self.fake_codex()
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("RECONCILE COMPLETE", result.stdout)
+        self.assertNotIn("ctx reconcile:", result.stdout)
+        for marker in (
+            "ctx reconcile: [1/5] checking context freshness",
+            "ctx reconcile: [2/5] inventorying",
+            "ctx reconcile: [2/5] prepared bounded read-only snapshot",
+            "ctx reconcile: [3/5] starting Codex semantic review",
+            "ctx reconcile: [4/5] Codex review finished",
+            "ctx reconcile: [5/5] proposal valid",
+            "ctx reconcile: [5/5] strict validation passed",
+            "ctx reconcile: [5/5] reconciliation published",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, result.stderr)
+
+    def test_reconcile_agent_wait_reports_elapsed_heartbeat(self) -> None:
+        messages: list[str] = []
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.06)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        self.addCleanup(
+            lambda: process.kill() if process.poll() is None else None
+        )
+
+        with mock.patch.object(
+            reconciliation,
+            "RECONCILE_AGENT_HEARTBEAT_SECONDS",
+            0.01,
+        ):
+            returncode = reconciliation._wait_for_reconcile_agent(
+                process,
+                progress=messages.append,
+                label="[3/5] Codex semantic review",
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertTrue(
+            any(
+                "Codex semantic review still running" in message
+                and "elapsed" in message
+                and "Ctrl-C to stop safely" in message
+                for message in messages
+            ),
+            messages,
+        )
+
     @unittest.skipIf(os.name == "nt", "requires symlink support")
     def test_dependency_symlink_is_excluded_from_guarded_reconciliation(self) -> None:
         dependency_target = self.base / "shared-node-modules"
@@ -987,6 +1182,16 @@ if mode == "provider-failure":
         environment["FAKE_RECONCILE_MODE"] = "graph-invalid"
         result = self.run_ctx("reconcile", extra_environment=environment)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("RECONCILE PROPOSAL REJECTED", result.stdout)
+        self.assertIn("no project files changed", result.stdout)
+        self.assertNotIn("INVALID reconcile-project", result.stdout)
+        self.assertIn(
+            "ctx reconcile: [4/5] proposal rejected by strict graph validation; "
+            "no project files changed",
+            result.stderr,
+        )
+        self.assertIn(str(manifest), result.stderr)
+        self.assertNotIn("/ctx-reconcile-", result.stderr)
         self.assertEqual(manifest.read_bytes(), before_manifest)
         self.assertEqual((self.project / ".ctx" / "lock.json").read_bytes(), before_lock)
 

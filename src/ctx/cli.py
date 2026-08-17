@@ -6,6 +6,7 @@ import json
 import shlex
 import sys
 import unicodedata
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Sequence
@@ -629,6 +630,10 @@ def _agents_progress(message: str) -> None:
     print(f"ctx agents: {_safe_display(message)}", file=sys.stderr, flush=True)
 
 
+def _reconcile_progress(message: str) -> None:
+    print(f"ctx reconcile: {_safe_display(message)}", file=sys.stderr, flush=True)
+
+
 def _print_retrofit_next_steps(root: Path) -> None:
     quoted_root = shlex.quote(str(root))
     task = shlex.quote("Map this project and route me to its main semantic scopes")
@@ -765,6 +770,25 @@ def _render_validation(result: ValidationResult) -> None:
     )
     for diagnostic in result.diagnostics:
         print(_render_diagnostic(diagnostic), file=sys.stderr)
+
+
+def _render_reconcile_rejection(result: Any) -> None:
+    validation = result.validation
+    print(
+        f"RECONCILE PROPOSAL REJECTED {result.root}: "
+        f"{len(validation.nodes)} node(s), {len(validation.errors)} error(s), "
+        f"{len(validation.warnings)} warning(s); no project files changed"
+    )
+    for diagnostic in validation.diagnostics:
+        displayed = diagnostic
+        if diagnostic.manifest is not None:
+            try:
+                relative = diagnostic.manifest.relative_to(validation.project_root)
+            except ValueError:
+                pass
+            else:
+                displayed = replace(diagnostic, manifest=result.root / relative)
+        print(_render_diagnostic(displayed), file=sys.stderr)
 
 
 def _render_run_inspection(payload: dict[str, Any]) -> None:
@@ -1182,9 +1206,10 @@ def _execute(args: argparse.Namespace) -> int:
             target,
             dry_run=args.dry_run,
             acknowledge_reason=args.acknowledge,
+            progress=_reconcile_progress,
         )
         if not result.validation.valid:
-            _render_validation(result.validation)
+            _render_reconcile_rejection(result)
             return 3 if result.validation.unsafe else 1
         if result.dry_run:
             print(

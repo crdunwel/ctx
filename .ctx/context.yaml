@@ -321,12 +321,13 @@ items:
     kind: invariant
     title: Agent automation returns constrained proposals
     summary: >
-      Automation uses filtered read-only snapshots and locally validated,
-      evidence-bound proposals. Retrofit blocks unresolved areas and conflicts.
-      AGENTS.md review exhaustively assesses selected changes, materializes
-      bounded exact-match edits, permits only a narrowly gated correction, and
-      saves a content-addressed plan for explicit race-checked application;
-      applying already-matching safe bytes is idempotent.
+      Automation uses filtered read-only snapshots and validated, evidence-bound
+      proposals. Reconciliation reports stages, retries one bounded schema or
+      item-evidence defect, and rejects invalid proposals without publication.
+      Retrofit blocks unresolved areas and conflicts. AGENTS.md review assesses
+      selected changes, materializes exact-match edits, permits one gated
+      correction, and saves a content-addressed plan for race-checked
+      application; applying matching safe bytes is idempotent.
     artifacts:
       - src/ctx/retrofit_agent.py
       - src/ctx/reconciliation.py

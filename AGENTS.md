@@ -483,6 +483,8 @@ source changes
 
 Do not run an LLM after every save. Files may be temporarily inconsistent during a refactor, and most edits do not alter durable meaning.
 
+Bare guarded reconciliation reports freshness, inventory, agent review, proposal validation, and publication progress on stderr while reserving stdout for the final result. During agent review it emits a ten-second elapsed heartbeat; interruption must terminate and reap the child without publishing. Suppress raw provider transcripts. A locally correctable output-schema, manifest-schema, or item-artifact evidence defect may trigger exactly one isolated correction review against the same bounded snapshot. If validation still fails, report that no project files changed and render diagnostics against checkout paths rather than temporary validation paths.
+
 ### 13.1 Inspect
 
 `ctx reconcile inspect` reports the run, changed paths, pre-existing dirty paths,

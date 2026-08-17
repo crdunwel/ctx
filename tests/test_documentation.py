@@ -105,6 +105,22 @@ class DocumentationSurfaceTests(unittest.TestCase):
                 self.assertIn("deleted", normalized)
                 self.assertIn("current source", normalized)
 
+    def test_docs_explain_reconcile_progress_and_safe_interruption(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        cli_reference = (REPOSITORY / "docs" / "CLI.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, document in (("README", readme), ("CLI reference", cli_reference)):
+            with self.subTest(document=name):
+                normalized = " ".join(document.split()).lower()
+                self.assertIn("five stages", normalized)
+                self.assertIn("stderr", normalized)
+                self.assertIn("ten seconds", normalized)
+                self.assertIn("ctrl-c", normalized)
+                self.assertIn("without publishing", normalized)
+                self.assertIn("stdout", normalized)
+
     def test_docs_define_guarded_agents_review_boundaries(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         cli_reference = (REPOSITORY / "docs" / "CLI.md").read_text(

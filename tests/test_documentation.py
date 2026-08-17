@@ -39,9 +39,18 @@ class DocumentationSurfaceTests(unittest.TestCase):
     def test_readme_has_model_free_first_value_path(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
 
+        self.assertIn("versioned map of what your code means", readme)
+        self.assertIn("## Why ctx", readme)
         self.assertIn("## Get value in 60 seconds", readme)
+        self.assertIn("ctx demo /tmp/ctx-permit-board-demo", readme)
+        self.assertIn("python -m unittest discover -s tests -q", readme)
+        self.assertIn("ctx status --check", readme)
         self.assertIn('ctx hydrate --task "Explain how', readme)
+        self.assertIn("ctx hydrate --from permit_board/policy", readme)
+        self.assertIn("# simulated source change", readme)
         self.assertIn("without invoking a model", readme)
+        self.assertIn("## Add ctx to an existing project", readme)
+        self.assertIn("ctx retrofit", readme)
 
     def test_docs_distinguish_hooks_from_slash_commands_and_desktop(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")

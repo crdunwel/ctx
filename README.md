@@ -1,15 +1,41 @@
 # ctx
 
-`ctx` gives AI agents durable, project-specific context without putting the
-whole repository into every prompt.
+**Give coding agents a versioned map of what your code means—without putting
+the whole repository into every prompt.**
 
-It stores meaning beside the source in version-controlled `.ctx/context.yaml`
-files: important artifacts, invariants, architectural decisions, reusable
-patterns, and links to related context.
+AI agents can read source, but every new task otherwise starts with the same
+expensive rediscovery: where the important boundaries are, which files are
+authoritative, and which rules must not be broken. `ctx` stores that durable
+meaning beside the code in small, version-controlled `.ctx/context.yaml` files.
+
+For each task, `ctx hydrate` returns the nearest semantic scope, its invariants
+and decisions, and the source paths that prove them. It detects when source has
+changed since that meaning was reviewed, so stale context is visible instead of
+quietly misleading the next agent.
 
 > [!WARNING]
 > **Experimental alpha.** The CLI and manifest schema may change before V1.
 > Use ctx in version-controlled projects and review generated context and hooks.
+
+## Why ctx
+
+| Common agent problem | What ctx provides |
+|---|---|
+| Every task begins with repository-wide orientation | A compact packet for the directory and task at hand |
+| Architecture and constraints disappear with the chat | Durable, reviewable meaning committed beside source |
+| Documentation silently drifts from implementation | Deterministic freshness checks and explicit reconciliation |
+| Useful patterns in other projects are hard to find safely | Stable `ctx://` references, registry search, and selective hydration |
+
+The operating loop is intentionally small:
+
+```text
+source changes -> ctx detects stale meaning -> an agent or human reviews it
+               -> .ctx is updated or acknowledged -> future hydration is fresh
+```
+
+Source always remains authoritative. `.ctx` is a map to the source and its
+durable constraints, not a copy of the repository or a replacement for reading
+code.
 
 ## Install
 
@@ -25,22 +51,61 @@ ctx doctor
 
 ## Get value in 60 seconds
 
-To try ctx without invoking a model or changing an existing project:
+Create a disposable working project, run its tests, confirm its context is
+fresh, and ask for task-specific orientation:
 
 ```bash
 ctx demo /tmp/ctx-permit-board-demo
 cd /tmp/ctx-permit-board-demo
+python -m unittest discover -s tests -q
+ctx status --check
 ctx hydrate --task "Explain how an application becomes ready for review"
 ```
 
-The output is the exact bounded context packet an agent receives: active scope,
-durable rules, routing to narrower scopes, and authoritative source paths.
+Everything in this first path is local and works without invoking a model. The
+hydration output is the exact bounded packet an agent receives. It includes:
 
-For a real project, run:
+```text
+Active scope: ctx://permit-board-demo
+Freshness: active=fresh; project_fresh=true
+Available child scope: ctx://permit-board-demo/policy
+Artifacts: README.md, AGENTS.md, models.py, workflow.py, test_workflow.py
+Invariant: application identity remains stable
+Pattern: ordered deterministic review pipeline
+```
+
+Now follow the semantic boundary into the policy code:
+
+```bash
+ctx hydrate --from permit_board/policy \
+  --task "Why are fee and eligibility rules separate?"
+```
+
+The active scope changes to `ctx://permit-board-demo/policy`, expands the fee
+and readiness invariants, and keeps only compact root constraints as inherited
+context. This is progressive hydration: the agent gets the map and rules for
+the code it is actually about to change.
+
+To prove that freshness is real rather than a timestamp, change the disposable
+sample and check again:
+
+```bash
+printf '\n# simulated source change\n' >> permit_board/workflow.py
+ctx status --check
+```
+
+The command exits nonzero and reports the root node as stale because the owned
+source fingerprint changed.
+
+## Add ctx to an existing project
+
+For the shortest agent-assisted setup:
 
 ```bash
 cd /path/to/project
 ctx retrofit
+ctx validate --strict
+ctx status --check
 ctx hydrate --task "Orient me to this project and identify the best next scope"
 ```
 
@@ -54,6 +119,16 @@ Review `.ctx/` and any project `.codex/hooks.json`, then commit them with the
 source. The explicit `ctx hydrate` command works immediately with any agent
 that can run a CLI. `ctx` does not install a `/ctx` slash command or add an
 item to Codex's command palette.
+
+Prefer reviewing before publication? Use the proposal workflow:
+
+```bash
+ctx retrofit --dry-run
+ctx retrofit --show-plan PLAN_ID
+ctx retrofit --apply PLAN_ID
+```
+
+## Optional integrations
 
 ### Automatic hooks in the Codex CLI/TUI
 
@@ -200,18 +275,11 @@ No Git hook runs this workflow automatically. A future instruction change
 should remain an explicit, diff-visible review rather than becoming governing
 text merely because a commit occurred.
 
-## Try the sample project
+## Test it with an agent
 
-Create a complete example without invoking a model:
-
-```bash
-ctx demo /tmp/ctx-permit-board-demo
-cd /tmp/ctx-permit-board-demo
-ctx hydrate --task "How does an application become ready for review?"
-```
-
-To try automatic hydration, start the Codex CLI in this directory, run `/hooks`,
-and review and trust the two project hooks. Then ask:
+The 60-second demo is already a complete context-enabled project. To test
+automatic hydration, start the Codex CLI inside it, run `/hooks`, and review and
+trust the two project hooks. Then ask:
 
 > How does an application become ready for review, and which rule has
 > precedence?
@@ -226,11 +294,10 @@ Finally, try a real change:
 > Add a waived-fee path for public agencies without making unpaid private
 > applications ready.
 
-The sample includes working source and tests, a root context, a nested policy
-scope, Codex hooks, and a fresh lock. It demonstrates orientation, progressive
-hydration as work moves through the tree, artifact routing, invariants, and
-stop-time reconciliation. `ctx demo` never overwrites an existing path. Outside
-an existing ctx project, bare `ctx demo` creates `./ctx-permit-board-demo`.
+These prompts exercise orientation, progressive hydration as work moves through
+the tree, artifact routing, invariant preservation, and stop-time
+reconciliation. `ctx demo` never overwrites an existing path. Outside an
+existing ctx project, bare `ctx demo` creates `./ctx-permit-board-demo`.
 
 ## Common commands
 

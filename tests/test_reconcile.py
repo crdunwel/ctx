@@ -9,7 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ctx.cli import _safe_display
 from ctx.freshness import seal_freshness
+from ctx.retrofit_agent import MAX_AGENT_OUTPUT_BYTES, MAX_PROPOSED_MANIFESTS
+from ctx.yamlio import MAX_MANIFEST_BYTES
 
 
 class ReconcileCliTests(unittest.TestCase):
@@ -116,6 +119,672 @@ result.write_text(json.dumps(payload, sort_keys=True) + "\\n", encoding="utf-8")
         return directory, {
             "PATH": str(directory) + os.pathsep + os.environ.get("PATH", ""),
         }
+
+    def correction_fake_codex(self) -> tuple[Path, Path, dict[str, str]]:
+        directory = self.base / "correction-bin"
+        directory.mkdir(exist_ok=True)
+        executable = directory / "codex"
+        record = self.base / "reconcile-correction-invocations.jsonl"
+        script = f'''#!{Path(sys.executable).resolve()}
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+prompt = sys.stdin.read()
+workspace = Path(arguments[arguments.index("-C") + 1])
+schema_path = Path(arguments[arguments.index("--output-schema") + 1])
+result_path = Path(arguments[arguments.index("--output-last-message") + 1])
+record_path = Path(os.environ["FAKE_RECONCILE_INVOCATIONS"])
+live_root = Path(os.environ["FAKE_RECONCILE_LIVE_ROOT"])
+mode = os.environ.get("FAKE_RECONCILE_CORRECTION_MODE", "valid-update")
+attempt = 1
+if record_path.exists():
+    attempt += len(record_path.read_text(encoding="utf-8").splitlines())
+
+
+def descriptor_kind(descriptor: int) -> str:
+    mode_bits = os.fstat(descriptor).st_mode
+    if stat.S_ISREG(mode_bits):
+        return "regular"
+    if stat.S_ISFIFO(mode_bits):
+        return "pipe"
+    if stat.S_ISCHR(mode_bits):
+        return "character"
+    return "other"
+
+
+def snapshot(root: Path) -> list[list[object]]:
+    records: list[list[object]] = []
+    for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode):
+            records.append([
+                relative,
+                "file",
+                stat.S_IMODE(metadata.st_mode),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            ])
+        elif stat.S_ISDIR(metadata.st_mode):
+            records.append([relative, "directory", stat.S_IMODE(metadata.st_mode)])
+        elif stat.S_ISLNK(metadata.st_mode):
+            records.append([relative, "symlink", os.readlink(path)])
+        else:
+            records.append([relative, "special", stat.S_IMODE(metadata.st_mode)])
+    return records
+
+
+snapshot_before = snapshot(workspace)
+valid_manifest = """version: 1
+project:
+  id: reconcile-project
+  name: Reconcile Project
+  aliases: []
+node:
+  id: root
+  name: Reconcile Project
+  summary: Current source now establishes a durable bounded operating rule.
+items:
+  - id: bounded-operating-rule
+    kind: invariant
+    title: Bounded operating rule
+    summary: Future changes must preserve the evidence-backed operating rule.
+"""
+invalid_summary_canary = "FIRST_INVALID_OUTPUT_CANARY_36ca42"
+invalid_manifest = valid_manifest.replace(
+    "Future changes must preserve the evidence-backed operating rule.",
+    invalid_summary_canary + ("s" * (501 - len(invalid_summary_canary))),
+)
+graph_invalid_manifest = valid_manifest + """artifacts:
+  - path: missing.py
+    role: This source path does not exist.
+"""
+adapter_prose_manifest = valid_manifest.replace(
+    "Current source now establishes a durable bounded operating rule.",
+    "Durable prose preserves the `.ctx-retrofit` adapter name as project context.",
+)
+
+if mode == "provider-failure":
+    payload = None
+elif mode == "surrogate-summary":
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": valid_manifest,
+        }}],
+        "acknowledgements": [],
+        "summary": chr(0xD800),
+    }}
+elif mode == "surrogate-acknowledgement":
+    payload = {{
+        "manifests": [],
+        "acknowledgements": [{{
+            "uri": "ctx://reconcile-project",
+            "reason": "Implementation-only " + chr(0xD800),
+        }}],
+        "summary": "Rejected unsafe acknowledgement text.",
+    }}
+elif mode == "unsafe-path":
+    payload = {{
+        "manifests": [{{"path": "../.ctx/context.yaml", "content": valid_manifest}}],
+        "acknowledgements": [],
+        "summary": "Unsafe path must not be retried.",
+    }}
+elif mode == "coverage-incomplete":
+    payload = {{
+        "manifests": [],
+        "acknowledgements": [],
+        "summary": "Affected scope was omitted.",
+    }}
+elif mode == "graph-invalid":
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": graph_invalid_manifest,
+        }}],
+        "acknowledgements": [],
+        "summary": "Graph-invalid result must not be retried.",
+    }}
+elif mode == "valid-preserve-adapter-prose":
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": adapter_prose_manifest,
+        }}],
+        "acknowledgements": [],
+        "summary": "Preserved valid durable prose while updating the manifest.",
+    }}
+elif mode in {{"invalid-before-unsafe", "unsafe-before-invalid"}}:
+    invalid_entry = {{"path": ".ctx/context.yaml", "content": invalid_manifest}}
+    unsafe_entry = {{"path": "../.ctx/context.yaml", "content": valid_manifest}}
+    payload = {{
+        "manifests": (
+            [invalid_entry, unsafe_entry]
+            if mode == "invalid-before-unsafe"
+            else [unsafe_entry, invalid_entry]
+        ),
+        "acknowledgements": [],
+        "summary": "Fatal unsafe scope must win over local correction.",
+    }}
+elif mode == "invalid-with-duplicate-coverage":
+    payload = {{
+        "manifests": [
+            {{"path": ".ctx/context.yaml", "content": invalid_manifest}},
+            {{"path": ".ctx/context.yaml", "content": valid_manifest}},
+        ],
+        "acknowledgements": [],
+        "summary": "Fatal duplicate coverage must win over local correction.",
+    }}
+elif mode == "invalid-with-generated-diff-reference":
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": invalid_manifest + """tracking:
+  include:
+    - .ctx-retrofit-reconcile-diff.patch
+""",
+        }}],
+        "acknowledgements": [],
+        "summary": "Generated evidence policy must win over local correction.",
+    }}
+elif mode == "invalid-with-adapter-reference":
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": invalid_manifest + """tracking:
+  include:
+    - .ctx-retrofit-evidence.json
+""",
+        }}],
+        "acknowledgements": [],
+        "summary": "Generated adapter policy must win over local correction.",
+    }}
+elif mode == "invalid-summary-then-missing-result" and attempt == 2:
+    payload = None
+else:
+    invalid = mode in {{
+        "invalid-summary-always",
+        "invalid-summary-once",
+        "invalid-summary-then-missing-result",
+        "invalid-summary-with-manifest-race",
+        "invalid-summary-with-source-race",
+        "invalid-summary-then-source-race",
+    }} and (attempt == 1 or mode == "invalid-summary-always")
+    payload = {{
+        "manifests": [{{
+            "path": ".ctx/context.yaml",
+            "content": invalid_manifest if invalid else valid_manifest,
+        }}],
+        "acknowledgements": [],
+        "summary": "Proposed one evidence-backed durable update.",
+    }}
+
+transcript_canary = os.environ.get(
+    "FAKE_RECONCILE_TRANSCRIPT_CANARY",
+    "RECONCILE_PROVIDER_TRANSCRIPT_CANARY",
+)
+prompt_transcript_canary = "CTX_RECONCILE_PROMPT_VERSION=2"
+result_transcript_canary = "RECONCILE_RESULT_TRANSCRIPT_CANARY_b25344"
+print(
+    "provider stdout " + prompt_transcript_canary + " "
+    + result_transcript_canary + " " + transcript_canary + ("o" * 32_000)
+)
+print(
+    "provider stderr " + prompt_transcript_canary + " "
+    + result_transcript_canary + " " + transcript_canary + ("e" * 32_000),
+    file=sys.stderr,
+)
+if payload is not None:
+    result_path.write_text(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\\n",
+        encoding="utf-8",
+    )
+
+if mode == "source-race" or (
+    mode == "invalid-summary-with-source-race" and attempt == 1
+) or (
+    mode == "invalid-summary-then-source-race" and attempt == 2
+):
+    (live_root / "app.py").write_text(
+        "CHANGED_DURING_REVIEW = True\\n", encoding="utf-8"
+    )
+if mode == "invalid-summary-with-manifest-race" and attempt == 1:
+    live_manifest = live_root / ".ctx" / "context.yaml"
+    live_manifest.write_text(
+        live_manifest.read_text(encoding="utf-8").replace(
+            "node:\\n  id: root\\n  name: Reconcile Project\\n",
+            "node:\\n  id: root\\n  name: Reconcile Project\\n"
+            "  summary: MANIFEST_RACE_CANARY_1cb282\\n",
+        ),
+        encoding="utf-8",
+    )
+
+configs = [
+    arguments[index + 1]
+    for index, value in enumerate(arguments[:-1])
+    if value == "-c"
+]
+sqlite_value = next(value for value in configs if value.startswith("sqlite_home="))
+invocation = {{
+    "attempt": attempt,
+    "argv": arguments,
+    "prompt": prompt,
+    "workspace": str(workspace),
+    "schema_path": str(schema_path),
+    "schema": json.loads(schema_path.read_text(encoding="utf-8")),
+    "result_path": str(result_path),
+    "sqlite_home": json.loads(sqlite_value.split("=", 1)[1]),
+    "snapshot_before": snapshot_before,
+    "snapshot_after": snapshot(workspace),
+    "stdout_kind": descriptor_kind(sys.stdout.fileno()),
+    "stderr_kind": descriptor_kind(sys.stderr.fileno()),
+}}
+with record_path.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(invocation, ensure_ascii=True, sort_keys=True) + "\\n")
+if mode == "provider-failure":
+    raise SystemExit(23)
+'''
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        return directory, record, {
+            "PATH": str(directory) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_RECONCILE_INVOCATIONS": str(record),
+            "FAKE_RECONCILE_LIVE_ROOT": str(self.project.resolve()),
+        }
+
+    def read_correction_invocations(self, record: Path) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in record.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_local_manifest_schema_error_gets_one_isolated_correction(self) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        source_canary = "RECONCILE_SOURCE_OUTPUT_CANARY_36e278"
+        transcript_canary = "RECONCILE_TRANSCRIPT_CANARY_72bc84"
+        self.source.write_text(source_canary + "\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment.update(
+            {
+                "FAKE_RECONCILE_CORRECTION_MODE": "invalid-summary-once",
+                "FAKE_RECONCILE_TRANSCRIPT_CANARY": transcript_canary,
+            }
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 manifest(s) updated", result.stdout)
+        invocations = self.read_correction_invocations(record)
+        self.assertEqual([item["attempt"] for item in invocations], [1, 2])
+        self.assertEqual(
+            {str(item["workspace"]) for item in invocations},
+            {str(invocations[0]["workspace"])},
+        )
+        self.assertEqual(
+            invocations[0]["snapshot_before"], invocations[1]["snapshot_before"]
+        )
+        for invocation in invocations:
+            self.assertEqual(
+                invocation["snapshot_before"], invocation["snapshot_after"]
+            )
+            self.assertEqual(invocation["stdout_kind"], "character")
+            self.assertEqual(invocation["stderr_kind"], "character")
+        self.assertEqual(
+            len({str(item["schema_path"]) for item in invocations}), 2
+        )
+        self.assertEqual(
+            len({str(item["result_path"]) for item in invocations}), 2
+        )
+        self.assertEqual(
+            len({str(item["sqlite_home"]) for item in invocations}), 2
+        )
+        self.assertEqual(invocations[0]["schema"], invocations[1]["schema"])
+        schema = invocations[0]["schema"]
+        self.assertEqual(
+            schema["properties"]["manifests"]["maxItems"],
+            MAX_PROPOSED_MANIFESTS,
+        )
+        self.assertEqual(
+            schema["properties"]["acknowledgements"]["maxItems"],
+            MAX_PROPOSED_MANIFESTS,
+        )
+
+        first_prompt = str(invocations[0]["prompt"])
+        correction_prompt = str(invocations[1]["prompt"])
+        marker = "# One-time bounded schema correction"
+        self.assertNotIn(marker, first_prompt)
+        self.assertIn(marker, correction_prompt)
+        self.assertIn(
+            "every node or\nitem summary has at most 500 characters",
+            first_prompt,
+        )
+        self.assertIn(
+            "acknowledgement reason must contain 1 to 500 characters including "
+            "at least one\nnon-whitespace character",
+            first_prompt,
+        )
+        self.assertIn(
+            "The aggregate UTF-8 size of all proposed\nmanifest contents and the "
+            "UTF-8 size of the complete JSON result file must\neach be at most "
+            f"{MAX_AGENT_OUTPUT_BYTES} bytes.",
+            first_prompt,
+        )
+        self.assertIn(
+            f"at most {MAX_MANIFEST_BYTES}\nUTF-8 bytes, uses LF line endings "
+            "with no carriage returns, and ends with a\nnewline",
+            first_prompt,
+        )
+        self.assertIn("untrusted model output", correction_prompt)
+        self.assertIn("schema-validation failure", correction_prompt)
+        self.assertIn("500-character limit", correction_prompt)
+        self.assertIn("same read-only snapshot", correction_prompt)
+        self.assertNotIn("FIRST_INVALID_OUTPUT_CANARY_36ca42", correction_prompt)
+        self.assertNotIn(transcript_canary, correction_prompt)
+        self.assertLessEqual(len(correction_prompt), len(first_prompt) + 4_096)
+
+        combined_output = result.stdout + result.stderr
+        self.assertNotIn("CTX_RECONCILE_PROMPT_VERSION=2", combined_output)
+        self.assertNotIn("RECONCILE_RESULT_TRANSCRIPT_CANARY_b25344", combined_output)
+        self.assertNotIn(source_canary, combined_output)
+        self.assertNotIn(transcript_canary, combined_output)
+        self.assertNotIn("FIRST_INVALID_OUTPUT_CANARY_36ca42", combined_output)
+        self.assertLess(len(result.stdout), 20_000)
+        self.assertLess(len(result.stderr), 20_000)
+        self.assertNotEqual(manifest.read_bytes(), original_manifest)
+        self.assertNotEqual(lock.read_bytes(), original_lock)
+        updated = manifest.read_text(encoding="utf-8")
+        self.assertIn("bounded-operating-rule", updated)
+        self.assertNotIn("FIRST_INVALID_OUTPUT_CANARY_36ca42", updated)
+        status = self.run_ctx("status", "--check", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertTrue(json.loads(status.stdout)["fresh"])
+
+    def test_second_local_manifest_schema_error_fails_without_writes(self) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        source_canary = "RECONCILE_SECOND_INVALID_SOURCE_CANARY_15a404"
+        transcript_canary = "RECONCILE_SECOND_INVALID_TRANSCRIPT_CANARY_e828d7"
+        self.source.write_text(source_canary + "\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment.update(
+            {
+                "FAKE_RECONCILE_CORRECTION_MODE": "invalid-summary-always",
+                "FAKE_RECONCILE_TRANSCRIPT_CANARY": transcript_canary,
+            }
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("reconcile.agent-output-invalid", result.stderr)
+        self.assertEqual(
+            [item["attempt"] for item in self.read_correction_invocations(record)],
+            [1, 2],
+        )
+        combined_output = result.stdout + result.stderr
+        self.assertNotIn("CTX_RECONCILE_PROMPT_VERSION=2", combined_output)
+        self.assertNotIn("RECONCILE_RESULT_TRANSCRIPT_CANARY_b25344", combined_output)
+        self.assertNotIn(source_canary, combined_output)
+        self.assertNotIn(transcript_canary, combined_output)
+        self.assertNotIn("FIRST_INVALID_OUTPUT_CANARY_36ca42", combined_output)
+        self.assertLess(len(result.stdout), 20_000)
+        self.assertLess(len(result.stderr), 20_000)
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        self.assertEqual(lock.read_bytes(), original_lock)
+
+    def test_valid_update_preserves_adapter_name_in_summary_prose(self) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        original = manifest.read_text(encoding="utf-8")
+        preserved_summary = (
+            "Durable prose preserves the `.ctx-retrofit` adapter name as project "
+            "context."
+        )
+        manifest.write_text(
+            original.replace(
+                "node:\n  id: root\n  name: Reconcile Project\n",
+                "node:\n  id: root\n  name: Reconcile Project\n"
+                f"  summary: {preserved_summary}\n",
+            ),
+            encoding="utf-8",
+        )
+        seal_freshness(self.project)
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment["FAKE_RECONCILE_CORRECTION_MODE"] = (
+            "valid-preserve-adapter-prose"
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [item["attempt"] for item in self.read_correction_invocations(record)],
+            [1],
+        )
+        updated = manifest.read_text(encoding="utf-8")
+        self.assertIn(preserved_summary, updated)
+        self.assertIn("bounded-operating-rule", updated)
+        status = self.run_ctx("status", "--check", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
+    def test_unpaired_surrogates_are_rejected_before_reconcile_publication(
+        self,
+    ) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        executable_directory, record, base_environment = self.correction_fake_codex()
+
+        for mode in ("surrogate-summary", "surrogate-acknowledgement"):
+            with self.subTest(mode=mode):
+                record.unlink(missing_ok=True)
+                environment = dict(base_environment)
+                environment.update(
+                    {
+                        "PATH": str(executable_directory)
+                        + os.pathsep
+                        + os.environ.get("PATH", ""),
+                        "FAKE_RECONCILE_CORRECTION_MODE": mode,
+                    }
+                )
+                result = self.run_ctx(
+                    "reconcile",
+                    extra_environment=environment,
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    result.stdout + result.stderr,
+                )
+                self.assertIn("reconcile.agent-output-invalid", result.stderr)
+                self.assertNotIn("internal.error", result.stderr)
+                self.assertEqual(
+                    [
+                        item["attempt"]
+                        for item in self.read_correction_invocations(record)
+                    ],
+                    [1, 2],
+                )
+                (result.stdout + result.stderr).encode("utf-8")
+                self.assertEqual(manifest.read_bytes(), original_manifest)
+                self.assertEqual(lock.read_bytes(), original_lock)
+
+        self.assertEqual(_safe_display(chr(0xD800)), "\\ud800")
+
+    def test_second_attempt_cannot_reuse_the_first_attempt_result(self) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        transcript_canary = "MISSING_SECOND_RESULT_TRANSCRIPT_CANARY_78d206"
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment.update(
+            {
+                "FAKE_RECONCILE_CORRECTION_MODE": (
+                    "invalid-summary-then-missing-result"
+                ),
+                "FAKE_RECONCILE_TRANSCRIPT_CANARY": transcript_canary,
+            }
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("reconcile.agent-output-invalid", result.stderr)
+        invocations = self.read_correction_invocations(record)
+        self.assertEqual([item["attempt"] for item in invocations], [1, 2])
+        self.assertNotEqual(
+            invocations[0]["result_path"], invocations[1]["result_path"]
+        )
+        self.assertNotIn(transcript_canary, result.stdout + result.stderr)
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        self.assertEqual(lock.read_bytes(), original_lock)
+
+    def test_policy_graph_provider_and_race_errors_do_not_get_correction_pass(
+        self,
+    ) -> None:
+        executable_directory, record, base_environment = self.correction_fake_codex()
+        cases = (
+            ("unsafe-path", 3, "reconcile.proposal-path"),
+            ("invalid-before-unsafe", 3, "reconcile.proposal-path"),
+            ("unsafe-before-invalid", 3, "reconcile.proposal-path"),
+            (
+                "invalid-with-duplicate-coverage",
+                1,
+                "reconcile.coverage-duplicate",
+            ),
+            (
+                "invalid-with-generated-diff-reference",
+                1,
+                "reconcile.agent-output-invalid",
+            ),
+            (
+                "invalid-with-adapter-reference",
+                1,
+                "reconcile.agent-output-invalid",
+            ),
+            ("coverage-incomplete", 1, "reconcile.coverage-incomplete"),
+            ("graph-invalid", 1, None),
+            ("provider-failure", 4, "reconcile.agent-failed"),
+            (
+                "invalid-summary-with-source-race",
+                4,
+                "reconcile.project-changed",
+            ),
+            (
+                "invalid-summary-with-manifest-race",
+                4,
+                "reconcile.project-changed",
+            ),
+        )
+        for mode, expected_exit, expected_error in cases:
+            with self.subTest(mode=mode):
+                record.unlink(missing_ok=True)
+                project = self.base / f"no-correction-{mode}"
+                project.mkdir()
+                source = project / "app.py"
+                source.write_text("VALUE = 1\n", encoding="utf-8")
+                initialized = self.run_ctx(
+                    "init",
+                    str(project),
+                    "--id",
+                    "reconcile-project",
+                    "--name",
+                    "Reconcile Project",
+                )
+                self.assertEqual(
+                    initialized.returncode,
+                    0,
+                    initialized.stdout + initialized.stderr,
+                )
+                seal_freshness(project)
+                manifest = project / ".ctx" / "context.yaml"
+                lock = project / ".ctx" / "lock.json"
+                original_manifest = manifest.read_bytes()
+                original_lock = lock.read_bytes()
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                environment = dict(base_environment)
+                environment.update(
+                    {
+                        "PATH": str(executable_directory)
+                        + os.pathsep
+                        + os.environ.get("PATH", ""),
+                        "FAKE_RECONCILE_CORRECTION_MODE": mode,
+                        "FAKE_RECONCILE_LIVE_ROOT": str(project.resolve()),
+                    }
+                )
+
+                result = self.run_ctx(
+                    "reconcile",
+                    str(project),
+                    extra_environment=environment,
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    expected_exit,
+                    result.stdout + result.stderr,
+                )
+                if expected_error is not None:
+                    self.assertIn(expected_error, result.stderr)
+                self.assertEqual(
+                    [
+                        item["attempt"]
+                        for item in self.read_correction_invocations(record)
+                    ],
+                    [1],
+                )
+                if mode == "invalid-summary-with-manifest-race":
+                    self.assertIn(
+                        "MANIFEST_RACE_CANARY_1cb282",
+                        manifest.read_text(encoding="utf-8"),
+                    )
+                    self.assertNotIn("bounded-operating-rule", manifest.read_text())
+                else:
+                    self.assertEqual(manifest.read_bytes(), original_manifest)
+                self.assertEqual(lock.read_bytes(), original_lock)
+
+    def test_race_after_correction_is_rejected_without_publication(self) -> None:
+        manifest = self.project / ".ctx" / "context.yaml"
+        lock = self.project / ".ctx" / "lock.json"
+        original_manifest = manifest.read_bytes()
+        original_lock = lock.read_bytes()
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, record, environment = self.correction_fake_codex()
+        environment["FAKE_RECONCILE_CORRECTION_MODE"] = (
+            "invalid-summary-then-source-race"
+        )
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("reconcile.project-changed", result.stderr)
+        self.assertEqual(
+            [item["attempt"] for item in self.read_correction_invocations(record)],
+            [1, 2],
+        )
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        self.assertEqual(lock.read_bytes(), original_lock)
+        self.assertEqual(
+            self.source.read_text(encoding="utf-8"),
+            "CHANGED_DURING_REVIEW = True\n",
+        )
 
     def test_acknowledgement_preserves_manifest_and_refreshes_lock(self) -> None:
         before = (self.project / ".ctx" / "context.yaml").read_bytes()

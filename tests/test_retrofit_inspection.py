@@ -1188,9 +1188,11 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
 
         real_seal = seal_freshness
 
-        def mutate_during_seal(path: Path) -> object:
+        def mutate_during_seal(path: Path, **kwargs: object) -> object:
+            self.assertEqual(kwargs["expected_previous"], previous_lock)
+            self.assertEqual(kwargs["mismatch_code"], "reconcile.project-changed")
             manifest.write_text(concurrent_manifest, encoding="utf-8")
-            return real_seal(path)
+            return real_seal(path, **kwargs)
 
         with (
             mock.patch.object(
@@ -1322,9 +1324,11 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         source.write_text("VALUE = 2\n", encoding="utf-8")
         real_seal = seal_freshness
 
-        def mutate_during_seal(path: Path) -> object:
+        def mutate_during_seal(path: Path, **kwargs: object) -> object:
+            self.assertEqual(kwargs["expected_previous"], previous_lock)
+            self.assertEqual(kwargs["mismatch_code"], "reconcile.project-changed")
             source.write_text("VALUE = 3\n", encoding="utf-8")
-            return real_seal(path)
+            return real_seal(path, **kwargs)
 
         with mock.patch.object(
             reconciliation,
@@ -1377,9 +1381,11 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         )
         real_seal = seal_freshness
 
-        def mutate_during_seal(path: Path) -> object:
+        def mutate_during_seal(path: Path, **kwargs: object) -> object:
+            self.assertEqual(kwargs["expected_previous"], previous_lock)
+            self.assertEqual(kwargs["mismatch_code"], "reconcile.project-changed")
             source.write_text("VALUE = 2\n", encoding="utf-8")
-            return real_seal(path)
+            return real_seal(path, **kwargs)
 
         with mock.patch.object(
             reconciliation,
@@ -1510,7 +1516,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
             original_manifest,
             encoding="utf-8",
         )
-        seal_freshness(root)
+        previous_lock = seal_freshness(root).path.read_bytes()
         source.write_text("VALUE = 2\n", encoding="utf-8")
 
         def fake_reconcile_agent(
@@ -1541,7 +1547,9 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
 
         real_seal = seal_freshness
 
-        def swap_during_seal(_path: Path) -> object:
+        def swap_during_seal(_path: Path, **kwargs: object) -> object:
+            self.assertEqual(kwargs["expected_previous"], previous_lock)
+            self.assertEqual(kwargs["mismatch_code"], "reconcile.project-changed")
             root.rename(displaced)
             (root / ".ctx").mkdir(parents=True)
             (root / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
@@ -1549,7 +1557,7 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
                 original_manifest,
                 encoding="utf-8",
             )
-            return real_seal(root)
+            return real_seal(root, **kwargs)
 
         with (
             mock.patch.object(

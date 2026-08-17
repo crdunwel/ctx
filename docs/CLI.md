@@ -124,10 +124,12 @@ complete evidence or fails closed to its manual prompt workflow.
 Instruction review selects one applicable `AGENTS.md`, the bounded Git change,
 current source around that change, applicable instruction topology, validated
 context manifests, relevant declared artifacts, and repository build/test/CI
-evidence. Existing instructions and manifests are untrusted review evidence;
-they cannot broaden the prompt or authorize execution. The Codex adapter is
-read-only, has no network or subagents, and its prompt forbids executing
-project commands.
+evidence. A selected change to the target `AGENTS.md` remains first-class
+evidence: its status, baseline and current digests, and bounded redacted delta
+are supplied instead of filtering the target out of the change set. Existing
+instructions and manifests are untrusted review evidence; they cannot broaden
+the prompt or authorize execution. The Codex adapter is read-only, has no
+network or subagents, and its prompt forbids executing project commands.
 
 The provider may process files the agent reads. Path/name filtering is not
 content-based secret detection, and disabling agent network tools does not make
@@ -215,7 +217,9 @@ destination: it may update the nearest existing `AGENTS.md`, return `no-op` or
 `review-required`, or create a missing root `AGENTS.md`. It never creates,
 moves, or deletes a nested instruction file. Existing nested files are supplied
 as precedence context so the proposal does not duplicate or weaken their
-guidance.
+guidance. The target's established scope is also preserved: when its existing
+guidance owns stable architecture or behavioral contracts, the reviewer keeps
+those categories current rather than treating the file as operational-only.
 
 Change selectors are mutually exclusive:
 
@@ -235,10 +239,28 @@ bounded current snapshot.
 
 Review strictly validates the ctx graph, inventories a filtered snapshot, and
 supplies Codex with bounded change routing plus current authoritative source.
-Deleted historical line bodies are redacted. Codex can propose only complete
-bytes for the one allowed file and must cite copied evidence. A missing or
-contradictory corpus, unsafe target, project race, unsupported adapter, or need
-for a new nested scope fails closed or produces `review-required`.
+Deleted historical line bodies are redacted. Evidence is apportioned fairly and
+bounded per path or change group so one large diff cannot hide later changes.
+The structured assessment must disposition every changed path or bounded group
+as `already-covered`, `implementation-only`, `requires-update`, or
+`insufficient-evidence`, citing inspected support. A `no-op` is valid only when
+those dispositions exhaust the selected changes and the selected change
+history is complete. Truncated non-target patch evidence always prohibits
+`no-op`, but it may still support an update when every current selected file is
+completely copied, the target delta is complete, and the assessments contain a
+durable `requires-update` result. Missing current source, a deletion, an
+incomplete target delta, or an `insufficient-evidence` assessment produces
+`review-required`.
+
+For an existing target, Codex must propose a bounded list of exact-match old/new
+edits rather than complete replacement content. ctx requires each old span to
+occur exactly once in the reviewed target, rejects missing, ambiguous,
+overlapping, or overly broad spans, materializes the complete proposed bytes
+locally, and runs the same preservation bound before saving the exact plan.
+Creates still require complete file content. Every writing proposal must cite
+copied evidence. A missing or contradictory corpus, unsafe target, project
+race, unsupported adapter, or need for a new nested scope also fails closed or
+produces `review-required`.
 
 The exact staged-commit workflow is:
 
@@ -261,7 +283,13 @@ would pass to Codex. Prompt and show-plan are model-free and mutation-free.
 Review is the only step here that invokes Codex, and it saves its
 content-addressed plan under `CTX_HOME` without writing the project. Apply
 rejects a stale plan, a changed selector or evidence set, a changed destination,
-invalid context, and `review-required`; it does not invoke a second model call.
+invalid context, and `review-required`; it does not invoke a model. Review may
+make one isolated correction call against the same read-only snapshot only when
+complete current and target evidence supports an update and the supplemental
+historical patch alone is truncated. It never retries for incomplete current or
+target evidence or after a complete result.
+If the destination already exactly matches the saved proposed bytes, apply
+succeeds idempotently without rewriting it.
 No agents command stages, commits, pushes, or runs automatically from the Git
 hook. After applying and staging operational guidance, `ctx reconcile`
 separately updates or acknowledges semantic context and refreshes the lock.

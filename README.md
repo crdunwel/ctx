@@ -155,11 +155,39 @@ git commit
 tracked changes or nonignored untracked files. This makes the evidence match
 the staged source. The review invokes Codex against a bounded read-only
 snapshot and saves a content-addressed proposal under `CTX_HOME`; it does not edit the project.
+When complete current and target evidence supports an update but only the
+supplemental historical patch is truncated, review may make one isolated
+correction call against that same read-only snapshot. It never retries for incomplete
+current or target evidence, and no other `ctx agents` command invokes a model.
+Any selected change to the destination `AGENTS.md` is first-class evidence,
+including its status, baseline and current digests, and bounded redacted delta.
+The reviewer preserves the target's established scope: if it already owns
+stable architecture or behavioral contracts, those categories remain in scope
+alongside operational commands.
+
+For an existing target, Codex must return bounded exact-match old/new edits
+rather than echoing the whole instruction file. ctx requires every old span to
+occur exactly once in the reviewed target, rejects overlapping edits, then
+materializes and preservation-checks the complete proposed bytes before saving
+the exact plan. Ambiguous, missing, or overly broad edits fail closed.
+
+Change evidence is bounded fairly per path so one oversized file cannot hide
+later changes. The review must disposition every changed path or bounded change
+group as `already-covered`, `implementation-only`, `requires-update`, or
+`insufficient-evidence`, with inspected support. A `no-op` is accepted only
+when those dispositions exhaust the selected changes and the selected change
+history is complete. A truncated non-target patch may still support an update
+when every current selected file is completely copied, the target delta is
+complete, and the assessments require a durable edit. Missing current source,
+deleted paths, an incomplete target delta, or any insufficient assessment
+instead requires `review-required`.
+
 `show-plan` exposes the exact proposed bytes and evidence, and `apply` rechecks
 the project before atomically writing only the saved `AGENTS.md` proposal. It
-does not invoke Codex again, stage files, or commit. `ctx reconcile` then
-separately reviews whether the same change altered durable semantic context and
-refreshes `.ctx/lock.json`.
+does not invoke Codex again, stage files, or commit. Reapplying a plan when the
+destination already exactly matches its proposed bytes succeeds without
+rewriting it. `ctx reconcile` then separately reviews whether the same change
+altered durable semantic context and refreshes `.ctx/lock.json`.
 
 To inspect exactly what ctx would ask Codex without invoking a model or saving
 a plan, run:
@@ -291,7 +319,9 @@ mutually exclusive. `PATH` chooses the nearest applicable `AGENTS.md` scope.
 V1 may update that one existing file or create a missing root `AGENTS.md`; it
 never invents a new nested instruction file. Existing-file review requires a
 Git `HEAD`; a missing root file may instead be synthesized from a bounded
-current snapshot.
+current snapshot. The destination's established subject-matter scope is part of
+the contract being maintained, and a selected change to that destination is
+included in the review evidence rather than filtered out.
 
 ### Hydrate a specific task or directory
 

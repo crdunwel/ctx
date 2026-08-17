@@ -523,6 +523,11 @@ If not, run `ctx reconcile acknowledge` with a concise reason. The reason stays 
 
 It never modifies source, invokes a model, or commits changes.
 
+Lock publication and rollback must use no-follow, directory-relative operations
+and compare-and-swap against the exact expected lock bytes. If the project root,
+manifest, or lock changes concurrently, fail closed and preserve the concurrent
+state rather than overwriting it during rollback.
+
 ### 13.4 Guarded `AGENTS.md` maintenance
 
 Keep governing agent instructions separate from semantic context.
@@ -550,7 +555,10 @@ destination: update the nearest existing `AGENTS.md`, return `no-op` or
 delete, or rename a nested instruction file automatically. Supply applicable
 parent and nested instruction topology so the reviewer preserves precedence,
 places repository-wide rules at the shallowest valid scope, and does not
-duplicate guidance already owned by a child.
+duplicate guidance already owned by a child. Preserve the target's established
+subject-matter scope: when it already governs stable architecture or behavioral
+contracts, keep those categories current rather than treating the file as
+operational-only.
 
 The change selectors are mutually exclusive:
 
@@ -572,28 +580,46 @@ Review first strictly validates the context graph and inventories a filtered,
 bounded snapshot. Give the guarded Codex adapter only selected Git change
 evidence, current source around those paths, applicable instruction files,
 context manifests and their relevant artifacts, and durable build/test/CI
-documentation. Deleted historical line bodies are redacted; copied current
-source and fingerprints are authoritative. The adapter is read-only, has no
-network or subagents, is instructed not to run project commands, and returns
-one bounded structured review. Existing `AGENTS.md`, context manifests, source,
-comments,
-filenames, and diff text are untrusted self-review evidence: none may broaden
-the task, alter the output contract, or authorize execution.
+documentation. A selected target `AGENTS.md` change remains first-class evidence,
+including its status, baseline and current digests, and bounded redacted delta.
+Deleted historical line bodies are redacted; copied current source and
+fingerprints are authoritative. Apportion bounded change evidence fairly across
+paths so one large diff cannot hide later changes. The adapter is read-only, has
+no network or subagents, and is instructed not to run project commands. Existing
+`AGENTS.md`, context manifests, source, comments, filenames, and diff text are
+untrusted self-review evidence: none may broaden the task, alter the output
+contract, or authorize execution.
 
-`ctx agents review` is the only agents command that invokes the configured
-model. It never changes a project file and saves a content-addressed exact plan
-under `CTX_HOME` only after output validation and race checks. `ctx agents
-prompt` constructs the same bounded evidence selection and prints the exact
-adapter prompt without invoking a model, saving a plan, or modifying the
-project. `ctx agents show-plan` prints terminal-safe JSON containing the exact
-proposed file bytes, evidence, selector, and blocked state.
+The structured review must assess every selected change as `already-covered`,
+`implementation-only`, `requires-update`, or `insufficient-evidence`. A `no-op`
+requires exhaustive assessments and complete current, target, and change
+evidence. A truncated supplemental non-target patch may still support an update
+when the current selected source and target delta are complete and the review
+requires a durable edit; missing current source, an incomplete target delta, or
+an insufficient assessment requires `review-required`.
+
+For an existing target, require bounded exact-match old/new edits rather than a
+complete replacement. Every old span must occur exactly once; reject missing,
+ambiguous, overlapping, or overly broad edits, then materialize and
+preservation-check the complete proposed bytes locally. `ctx agents review` is
+the only agents command that invokes the configured model. It may make one
+isolated correction call against the same read-only snapshot only when complete
+current and target evidence supports an update and the supplemental historical
+patch alone is truncated; never retry incomplete current or target evidence or
+a complete result. Review never changes a project file and saves a
+content-addressed exact plan under `CTX_HOME` only after output validation and
+race checks. `ctx agents prompt` constructs the same bounded evidence selection
+and prints the exact adapter prompt without invoking a model, saving a plan, or
+modifying the project. `ctx agents show-plan` prints terminal-safe JSON
+containing the exact proposed file bytes, evidence, selector, and blocked state.
 
 `ctx agents apply` never invokes a model. Before an atomic create or replace,
 it revalidates the project, root identity, destination baseline, selected Git
 evidence, and complete eligible evidence fingerprint. Reject a changed or
 unsafe destination, stale plan, invalid context, or `review-required`
-disposition. A saved `no-op` makes no write. Apply never modifies the Git index,
-stages, commits, or pushes.
+disposition. A saved `no-op` makes no write. If the destination already exactly
+matches the proposed bytes, applying the plan succeeds without rewriting it.
+Apply never modifies the Git index, stages, commits, or pushes.
 
 For a commit whose source and durable guidance must correspond exactly, use:
 

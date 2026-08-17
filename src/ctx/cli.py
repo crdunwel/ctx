@@ -598,7 +598,7 @@ def _safe_display(value: object) -> str:
             codepoint < 32
             or codepoint == 127
             or 0x80 <= codepoint <= 0x9F
-            or unicodedata.category(character) == "Cf"
+            or unicodedata.category(character) in {"Cf", "Cs"}
         ):
             rendered.append(f"\\u{codepoint:04x}")
         else:

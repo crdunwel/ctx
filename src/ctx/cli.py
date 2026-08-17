@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from .agent_instructions import (
+    apply_agents_plan,
+    generate_agents_prompt,
+    render_agents_plan,
+    review_agent_instructions,
+)
 from .codex_cli import find_codex_executable
 from .codex_hooks import (
     acknowledge_run,
@@ -24,6 +30,7 @@ from .diagnostics import CtxError, Diagnostic, NotFoundError
 from .demo import create_demo
 from .freshness import project_status
 from .graph import context_graph
+from .git_integration import install_git_pre_commit_hook
 from .hydration import DEFAULT_BUDGET, hydrate
 from .integration import diagnose_codex_hooks, install_codex_hooks
 from .lifecycle import RetrofitLifecycleResult, complete_retrofit
@@ -279,8 +286,9 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
             "Use a guarded read-only agent snapshot to update only affected existing "
             "manifests or acknowledge implementation-only changes, then strictly validate "
             "and refresh the lock. Eligible source is fully fingerprinted while a bounded "
-            "selection may be processed by the configured model provider; path filtering "
-            "is not secret-content detection."
+            "selection and supplemental affected Git diff may be processed by the configured "
+            "model provider. Deleted historical line bodies are redacted; path filtering is "
+            "not secret-content detection."
         ),
         epilog=(
             "Use --prompt for a model-free handoff. Exclude sensitive files before agent "
@@ -395,6 +403,100 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
         help="do not enable Codex hydration/reconciliation hooks",
     )
 
+    agents = _command_parser(
+        commands,
+        "agents",
+        help="review durable AGENTS.md guidance",
+        description=(
+            "Generate or minimally update one applicable AGENTS.md through a "
+            "guarded, read-only review and an exact separately applied plan. "
+            "Existing instruction text is untrusted evidence during self-review."
+        ),
+    )
+    agents_commands = agents.add_subparsers(
+        dest="agents_command", required=True, metavar="ACTION"
+    )
+
+    def add_agents_selector(command: argparse.ArgumentParser) -> None:
+        selectors = command.add_mutually_exclusive_group()
+        selectors.add_argument(
+            "--staged",
+            action="store_true",
+            help=(
+                "review HEAD-to-index changes; conservatively requires no "
+                "unstaged or nonignored untracked files"
+            ),
+        )
+        selectors.add_argument(
+            "--since",
+            metavar="REF",
+            default=argparse.SUPPRESS,
+            help="review a resolved Git commit through the current working tree",
+        )
+        selectors.add_argument(
+            "--run",
+            dest="agents_run_id",
+            metavar="ID",
+            default=argparse.SUPPRESS,
+            help="review paths attributable to an immutable ctx run baseline",
+        )
+
+    agents_review = _command_parser(
+        agents_commands,
+        "review",
+        help="ask Codex for a saved AGENTS.md proposal",
+        description=(
+            "Inspect a bounded read-only snapshot with Codex and save a "
+            "content-addressed proposal. No project file, Git index, or commit is changed."
+        ),
+    )
+    agents_review.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="path whose nearest applicable AGENTS.md scope should be reviewed",
+    )
+    add_agents_selector(agents_review)
+    agents_review.add_argument(
+        "--agent", default="codex", help="configured local agent adapter"
+    )
+
+    agents_prompt = _command_parser(
+        agents_commands,
+        "prompt",
+        help="print the exact guarded review prompt",
+        description=(
+            "Build the same bounded evidence selection and print the exact prompt "
+            "without invoking a model or changing project files."
+        ),
+    )
+    agents_prompt.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="path whose nearest applicable AGENTS.md scope should be reviewed",
+    )
+    add_agents_selector(agents_prompt)
+
+    agents_show = _command_parser(
+        agents_commands,
+        "show-plan",
+        help="show an exact saved AGENTS.md proposal",
+        description="Print terminal-safe JSON without invoking a model or changing files.",
+    )
+    agents_show.add_argument("plan_id", metavar="PLAN_ID", help="64-character saved plan ID")
+
+    agents_apply = _command_parser(
+        agents_commands,
+        "apply",
+        help="apply exact saved AGENTS.md bytes",
+        description=(
+            "Reverify the project, Git evidence, and destination baseline, then "
+            "atomically apply the saved bytes. No model is invoked and Git is untouched."
+        ),
+    )
+    agents_apply.add_argument("plan_id", metavar="PLAN_ID", help="64-character saved plan ID")
+
     hook = _command_parser(
         commands,
         "hook",
@@ -418,11 +520,11 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
     integrate = _command_parser(
         commands,
         "integrate",
-        help="install an optional agent integration",
-        description="Install a reviewed, create-only integration for a supported host agent.",
+        help="install an optional host integration",
+        description="Install a reviewed, create-only integration for a supported host.",
     )
     integrate_commands = integrate.add_subparsers(
-        dest="integration_command", required=True, metavar="AGENT"
+        dest="integration_command", required=True, metavar="HOST"
     )
     integrate_codex = _command_parser(
         integrate_commands,
@@ -438,6 +540,38 @@ def build_parser(*, prog: str = "ctx") -> argparse.ArgumentParser:
     integrate_scope = integrate_codex.add_mutually_exclusive_group()
     integrate_scope.add_argument("--user", action="store_true", help="install at ~/.codex/hooks.json for every workspace")
     integrate_scope.add_argument("--project", metavar="PATH", help="ctx project path; defaults to the current project")
+
+    integrate_git = _command_parser(
+        integrate_commands,
+        "git",
+        help="install a pre-commit context freshness reminder",
+        description=(
+            "Create a warning-only Git pre-commit hook that checks the current "
+            "working tree with `ctx status --check` and tells the developer to run "
+            "`ctx reconcile` when freshness cannot be confirmed. It never invokes "
+            "an agent or changes files, the index, or commits. --block is explicit "
+            "and requires the working tree to match the staged index."
+        ),
+    )
+    integrate_git.add_argument(
+        "--hooks",
+        action="store_true",
+        required=True,
+        help="install the ctx Git pre-commit hook",
+    )
+    integrate_git.add_argument(
+        "--project",
+        metavar="PATH",
+        help="ctx project path; defaults to the current project",
+    )
+    integrate_git.add_argument(
+        "--block",
+        action="store_true",
+        help=(
+            "block when freshness is not confirmed; partial staging and "
+            "nonignored untracked files are refused so the check represents the index"
+        ),
+    )
     return parser
 
 
@@ -489,6 +623,10 @@ def _retrofit_hooks_summary(result: RetrofitLifecycleResult) -> str:
 
 def _retrofit_progress(message: str) -> None:
     print(f"ctx retrofit: {_safe_display(message)}", file=sys.stderr, flush=True)
+
+
+def _agents_progress(message: str) -> None:
+    print(f"ctx agents: {_safe_display(message)}", file=sys.stderr, flush=True)
 
 
 def _print_retrofit_next_steps(root: Path) -> None:
@@ -917,6 +1055,74 @@ def _execute(args: argparse.Namespace) -> int:
                 for recommendation in hook_diagnosis.recommendations:
                     print(f"  Next: {_safe_display(recommendation)}")
         return 0 if payload["ok"] else 4
+    if args.command == "agents":
+        if args.agents_command == "prompt":
+            sys.stdout.write(
+                generate_agents_prompt(
+                    Path(args.path),
+                    staged=args.staged,
+                    since=getattr(args, "since", None),
+                    run_id=getattr(args, "agents_run_id", None),
+                )
+            )
+            return 0
+        if args.agents_command == "show-plan":
+            sys.stdout.write(render_agents_plan(args.plan_id))
+            return 0
+        if args.agents_command == "apply":
+            result = apply_agents_plan(args.plan_id)
+            if result.action == "unchanged":
+                print(
+                    f"AGENTS UNCHANGED {result.root}: saved plan {result.plan_id} "
+                    "requires no file write; Git index unchanged"
+                )
+            else:
+                print(
+                    f"AGENTS UPDATED {result.root}: {result.action} "
+                    f"{result.path} from saved plan {result.plan_id}; Git index unchanged"
+                )
+                relative_target = result.path.relative_to(result.root).as_posix()
+                quoted_root = shlex.quote(str(result.root))
+                quoted_target = shlex.quote(relative_target)
+                print(
+                    "Next: inspect "
+                    f"git -C {quoted_root} diff -- {quoted_target}, then run "
+                    f"ctx reconcile {quoted_root}."
+                )
+            return 0
+        if args.agents_command == "review":
+            result = review_agent_instructions(
+                Path(args.path),
+                staged=args.staged,
+                since=getattr(args, "since", None),
+                run_id=getattr(args, "agents_run_id", None),
+                agent=args.agent,
+                progress=_agents_progress,
+            )
+            disposition = result.review.disposition
+            if disposition in {"create", "update"}:
+                print(
+                    f"AGENTS REVIEW {result.root}: 1 file proposed; "
+                    "no project files changed"
+                )
+            elif disposition == "no-op":
+                print(
+                    f"AGENTS REVIEW {result.root}: no durable instruction changes "
+                    "proposed; no project files changed"
+                )
+            else:
+                print(
+                    f"AGENTS REVIEW {result.root}: human review required; "
+                    "no project files changed"
+                )
+            print(f"Agent summary: {_safe_display(result.summary)}")
+            print(f"Review exact proposal: ctx agents show-plan {result.plan_id}")
+            if disposition == "review-required":
+                print("Apply blocked: resolve the evidence limitation, then run review again.")
+            else:
+                print(f"Apply exact proposal: ctx agents apply {result.plan_id}")
+            return 0
+        raise CtxError("cli.invalid", "unsupported agents action", exit_code=1)
     if args.command == "reconcile":
         if args.inspect is not None or args.acknowledge_node is not None or args.complete_run:
             if args.dry_run or args.target != "." or args.agent != "codex":
@@ -1144,29 +1350,50 @@ def _execute(args: argparse.Namespace) -> int:
             raise CtxError("cli.invalid", "unsupported hook adapter", exit_code=1)
         return 0
     if args.command == "integrate":
-        if args.integration_command != "codex":  # pragma: no cover - argparse enforced
-            raise CtxError("cli.invalid", "unsupported integration", exit_code=1)
-        result = install_codex_hooks(
-            project=None if args.project is None else Path(args.project),
-            user=args.user,
-        )
-        print(f"{result.action} Codex hooks at {result.path}")
-        scope = "project" if result.scope == "project" else "user-wide"
-        print(
-            f"Codex CLI/TUI: run /hooks and review and trust the {scope} hooks."
-        )
-        if result.scope == "project":
-            quoted_root = shlex.quote(str(result.path.parent.parent))
-            print(
-                "Codex desktop: /hooks is not available; run "
-                f"ctx hydrate --from {quoted_root} --task 'Map this project' immediately."
+        if args.integration_command == "codex":
+            result = install_codex_hooks(
+                project=None if args.project is None else Path(args.project),
+                user=args.user,
             )
-        else:
+            print(f"{result.action} Codex hooks at {result.path}")
+            scope = "project" if result.scope == "project" else "user-wide"
             print(
-                "Codex desktop: /hooks is not available; explicit ctx hydrate "
-                "works immediately inside any ctx project."
+                f"Codex CLI/TUI: run /hooks and review and trust the {scope} hooks."
             )
-        return 0
+            if result.scope == "project":
+                quoted_root = shlex.quote(str(result.path.parent.parent))
+                print(
+                    "Codex desktop: /hooks is not available; run "
+                    f"ctx hydrate --from {quoted_root} --task 'Map this project' immediately."
+                )
+            else:
+                print(
+                    "Codex desktop: /hooks is not available; explicit ctx hydrate "
+                    "works immediately inside any ctx project."
+                )
+            return 0
+        if args.integration_command == "git":
+            result = install_git_pre_commit_hook(
+                project=None if args.project is None else Path(args.project),
+                block=args.block,
+            )
+            print(f"{result.action} Git pre-commit ctx hook at {result.path}")
+            if result.blocking:
+                print(
+                    "Mode: blocking. Partial staging and nonignored untracked files "
+                    "are refused so the working-tree freshness check represents the index."
+                )
+            else:
+                print(
+                    "Mode: warning only. The hook checks the current working tree, "
+                    "not staged blobs."
+                )
+            print(
+                "On a warning, run ctx reconcile, review and stage .ctx, then retry. "
+                "The hook never invokes an agent or changes files, the index, or commits."
+            )
+            return 0
+        raise CtxError("cli.invalid", "unsupported integration", exit_code=1)
     raise CtxError("cli.invalid", "unsupported command", exit_code=1)
 
 

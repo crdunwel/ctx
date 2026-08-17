@@ -473,8 +473,13 @@ cannot yet be decided safely. `scope` is the normalized proposed/existing
 the summary must explain an ancestor or exclusion judgment rather than merely
 repeat the disposition. Cite at least one normalized project-relative evidence
 path from under each area. Do not use generated catalog or preview paths as
-evidence. An `unresolved` area deliberately prevents automatic publication or
-finalization while remaining visible in a saved dry-run plan.
+evidence. Every coverage and conflict evidence string must be copied verbatim
+from a `files[].path` value in `{INSPECTION_CATALOG_PATH}`. Before returning,
+check every cited path against that exact set. A path mentioned by source,
+documentation, a test, or another catalog field is not eligible evidence when
+it has no matching `files[].path` entry. An `unresolved` area deliberately
+prevents automatic publication or finalization while remaining visible in a
+saved dry-run plan.
 
 `conflicts` is also transient. Record each materially inconsistent contract,
 document, implementation, test, or context claim once. Use status `resolved`
@@ -611,6 +616,7 @@ def _run_codex(
     snapshot: InspectionSnapshot,
     *,
     progress: Callable[[str], None] | None = None,
+    evidence_retry: bool = False,
 ) -> Path:
     resolved_codex = find_codex_executable()
     if resolved_codex is None:
@@ -622,9 +628,10 @@ def _run_codex(
         )
     executable = str(resolved_codex.path)
 
-    schema_path = work_directory / "output-schema.json"
-    result_path = work_directory / "agent-result.json"
-    sqlite_home = work_directory / "codex-state"
+    suffix = "-evidence-retry" if evidence_retry else ""
+    schema_path = work_directory / f"output-schema{suffix}.json"
+    result_path = work_directory / f"agent-result{suffix}.json"
+    sqlite_home = work_directory / f"codex-state{suffix}"
     sqlite_home.mkdir(mode=0o700)
     schema_path.write_text(
         json.dumps(_OUTPUT_SCHEMA, ensure_ascii=True, sort_keys=True) + "\n",
@@ -681,6 +688,19 @@ def _run_codex(
         python_bin if not inherited_path else os.pathsep.join((python_bin, inherited_path))
     )
     prompt = _automated_prompt(inventory, snapshot_root, snapshot)
+    if evidence_retry:
+        prompt += f"""
+
+## Deterministic evidence correction
+
+A preceding semantic-review response was rejected because at least one
+coverage or conflict evidence string was not an exact member of the bounded
+inventory. Perform the review again and return a complete replacement response.
+Read `{INSPECTION_CATALOG_PATH}`, build the exact set of `files[].path` strings,
+and copy every coverage and conflict evidence path verbatim from that set. Do
+not cite a path merely because source or documentation refers to it. All other
+review and output requirements above remain unchanged.
+"""
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as prompt_stream, tempfile.TemporaryFile(
         mode="w+b"
     ) as error_stream:
@@ -2203,7 +2223,10 @@ def _scope_area(scope: str) -> str:
 def _evidence_is_under_area(path: str, area: str) -> bool:
     parts = PurePosixPath(path).parts
     if area == ".":
-        return len(parts) == 1
+        # ``.`` names the project-root review area, not only the bucket of
+        # files stored directly beside the root manifest.  A root scope may
+        # therefore cite inspected evidence from anywhere in the project.
+        return bool(parts)
     area_parts = PurePosixPath(area).parts
     return len(parts) > len(area_parts) and parts[: len(area_parts)] == area_parts
 
@@ -2516,6 +2539,15 @@ def _read_agent_output(
         allowed_scopes=proposed_scopes | frozenset(inventory.all_context_manifests),
     )
     return manifests, summary, coverage, conflicts
+
+
+def _retryable_agent_evidence_error(error: CtxError) -> bool:
+    """Identify provider evidence invention that one fresh review may correct."""
+
+    return (
+        error.code == "retrofit.agent-output-invalid"
+        and "references evidence outside the bounded inventory:" in error.message
+    )
 
 
 def _canonical_plan_payload(
@@ -3892,9 +3924,38 @@ def run_agent_retrofit(
                 progress,
                 "Codex semantic review finished; validating the proposal",
             )
-            raw_items, summary, coverage, conflicts = _read_agent_output(
-                result_path, inventory, inspection
-            )
+            try:
+                raw_items, summary, coverage, conflicts = _read_agent_output(
+                    result_path, inventory, inspection
+                )
+            except CtxError as exc:
+                if not _retryable_agent_evidence_error(exc):
+                    raise
+                _emit_agent_progress(
+                    progress,
+                    "Codex cited evidence outside the bounded inventory; "
+                    "retrying the semantic review once with exact catalog paths",
+                )
+                if progress is None:
+                    result_path = _run_codex(
+                        inventory,
+                        work_directory,
+                        snapshot_root,
+                        inspection,
+                        evidence_retry=True,
+                    )
+                else:
+                    result_path = _run_codex(
+                        inventory,
+                        work_directory,
+                        snapshot_root,
+                        inspection,
+                        progress=progress,
+                        evidence_retry=True,
+                    )
+                raw_items, summary, coverage, conflicts = _read_agent_output(
+                    result_path, inventory, inspection
+                )
             if _root_identity(inventory.root) != original_identity:
                 raise CtxError(
                     "retrofit.root-changed",

@@ -184,6 +184,7 @@ items:
             "doctor",
             "reconcile",
             "retrofit",
+            "agents",
             "hook",
             "integrate",
         ):
@@ -218,6 +219,34 @@ items:
         normalized_integrate_help = " ".join(integrate_help.stdout.split())
         self.assertIn("--hooks", integrate_help.stdout)
         self.assertIn("hook process PATH", normalized_integrate_help)
+
+        agents_help = self.run_ctx("help", "agents")
+        agents_review_help = self.run_ctx("help", "agents", "review")
+        agents_prompt_help = self.run_ctx("help", "agents", "prompt")
+        agents_show_help = self.run_ctx("help", "agents", "show-plan")
+        agents_apply_help = self.run_ctx("help", "agents", "apply")
+        for result in (
+            agents_help,
+            agents_review_help,
+            agents_prompt_help,
+            agents_show_help,
+            agents_apply_help,
+        ):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("show-plan", agents_help.stdout)
+        self.assertIn("--staged", agents_review_help.stdout)
+        self.assertIn("--since REF", agents_review_help.stdout)
+        self.assertIn("--run ID", agents_review_help.stdout)
+        self.assertIn("no project file", agents_review_help.stdout.casefold())
+        self.assertNotIn("default: None", agents_review_help.stdout)
+        self.assertIn("print the exact prompt", agents_prompt_help.stdout)
+        self.assertIn("PLAN_ID", agents_show_help.stdout)
+        self.assertIn("No model is invoked", agents_apply_help.stdout)
+        agents_selector_conflict = self.run_ctx(
+            "agents", "prompt", "--staged", "--since", "HEAD"
+        )
+        self.assertEqual(agents_selector_conflict.returncode, 1)
+        self.assertIn("not allowed with argument", agents_selector_conflict.stderr)
 
     def test_doctor_is_read_only_and_machine_readable(self) -> None:
         result = self.run_ctx("doctor", "--json")

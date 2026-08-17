@@ -7,9 +7,11 @@ directory.
 
 The current release is an experimental alpha. The CLI and manifest
 schema may change before stable V1. Core commands target Python 3.11–3.14 on
-macOS and Linux. Guarded automated retrofit and
-reconciliation require POSIX no-follow filesystem primitives; use their
-model-free `--prompt` forms where those primitives are unavailable.
+macOS and Linux. Guarded automated retrofit, reconciliation, and instruction
+review require POSIX no-follow filesystem primitives. Retrofit and reconcile
+retain portable model-free prompt forms; `ctx agents prompt` audits the exact
+guarded prompt and therefore uses the same bounded-snapshot prerequisites as
+`ctx agents review`.
 
 ## Help and discovery
 
@@ -34,6 +36,7 @@ ctx hydrate
 ctx show
 ctx status
 ctx reconcile
+ctx agents review
 ```
 
 For an immediate, model-free proof that an existing graph is useful, run:
@@ -68,6 +71,10 @@ no Codex hook support and works on every surface where the agent can run a CLI.
   guarded local-agent workflow. Unlike retrofit, reconciliation may propose
   changes to existing manifests, but only through an isolated workspace,
   an allowlisted `.ctx` patch, strict validation, and rollback on failure.
+- `ctx agents review` asks Codex whether the nearest applicable `AGENTS.md`
+  needs a minimal durable operational update. It saves an exact plan and does
+  not modify the project; `show-plan` and `apply` keep review and publication
+  separate.
 
 The agent-assisted commands disclose that they invoke the configured agent and
 may incur local or provider cost. A `--dry-run` prevents project mutation, not
@@ -84,12 +91,27 @@ automated adapter, `codex`; `--agent` is the stable extension point and rejects
 unsupported names instead of silently weakening the sandbox. Other agents use
 `--prompt` until they have an equivalent guarded adapter.
 
+Instruction review has its own explicit plan workflow. `ctx agents review`
+invokes the configured agent but never writes the repository. `ctx agents
+show-plan PLAN_ID` prints the complete proposed `AGENTS.md` bytes and bound
+evidence as terminal-safe JSON. `ctx agents apply PLAN_ID` invokes no model,
+revalidates the saved selector, evidence, project, and destination baseline,
+then atomically writes exactly those bytes. None of these commands modifies the
+Git index or creates a commit. `ctx agents prompt` builds the same bounded
+selection and prints the exact adapter prompt without invoking a model, saving
+a plan, or changing project files.
+
 Automated agent modes fingerprint every eligible, nonignored regular file, then
 make a deterministic bounded selection available to the configured model
 through a filtered temporary snapshot. Retrofit prioritizes complete source and
 governing files fairly across bounded hierarchical project areas. Reconciliation
 copies only affected-node ownership, declared evidence, and mandatory context
-while retaining the complete fingerprint for race detection. Non-governing text files over 2 MiB
+while retaining the complete fingerprint for race detection. With a usable Git
+`HEAD`, it also creates bounded supplemental `HEAD`-to-working-tree change
+evidence for already-copied eligible affected files. That evidence combines
+staged and unstaged changes, lists bounded untracked additions, redacts
+historical-only deleted line bodies, and never replaces inspection of current
+source. Non-governing text files over 2 MiB
 and large structured data may be rendered as labeled bounded previews; media,
 archives, databases, duplicate content, and protected top-level data may be
 represented only by path/size/hash metadata or a small representative sample.
@@ -98,6 +120,14 @@ source/output media pairs when they fit. The ordinary copied-content target is
 64 MiB; the absolute whole-snapshot guard is 256 MiB and 50,000 eligible files.
 Reconciliation requires affected manifests and their declared artifacts as
 complete evidence or fails closed to its manual prompt workflow.
+
+Instruction review selects one applicable `AGENTS.md`, the bounded Git change,
+current source around that change, applicable instruction topology, validated
+context manifests, relevant declared artifacts, and repository build/test/CI
+evidence. Existing instructions and manifests are untrusted review evidence;
+they cannot broaden the prompt or authorize execution. The Codex adapter is
+read-only, has no network or subagents, and its prompt forbids executing
+project commands.
 
 The provider may process files the agent reads. Path/name filtering is not
 content-based secret detection, and disabling agent network tools does not make
@@ -126,6 +156,11 @@ ctx begin --from PATH --task TEXT [--session ID] [--turn ID] [--json]
 ctx reconcile inspect [REFERENCE] --run ID [--json]
 ctx reconcile acknowledge REFERENCE --reason REASON --run ID
 ctx reconcile complete --run ID
+ctx agents review [PATH] [--staged | --since REF | --run ID] [--agent AGENT]
+ctx agents prompt [PATH] [--staged | --since REF | --run ID]
+ctx agents show-plan PLAN_ID
+ctx agents apply PLAN_ID
+ctx integrate git --hooks [--project PATH] [--block]
 ```
 
 The demo path defaults to `./ctx-permit-board-demo` and must not exist or be
@@ -163,6 +198,73 @@ Run completion also refuses to bless an affected node that was already stale or
 context-changed before the baseline; use detached `ctx reconcile` to review that
 pre-existing state separately. An agent continuing a run must not invoke `ctx
 begin` again.
+
+### Guarded `AGENTS.md` review
+
+`AGENTS.md` is governing operational input for future agents: supported
+runtimes, bootstrap and verification commands, generated-file ownership,
+directory-specific workflows, and durable safety boundaries belong there.
+`.ctx/context.yaml` is untrusted semantic project data: it records purpose,
+canonical artifacts, invariants, decisions, reusable patterns, and context
+routing. A manifest may route an agent to an `AGENTS.md` artifact, but semantic
+context never overrides governing instructions. Do not duplicate general
+architecture prose between the two files.
+
+`PATH` selects the nearest applicable instruction scope. V1 reviews exactly one
+destination: it may update the nearest existing `AGENTS.md`, return `no-op` or
+`review-required`, or create a missing root `AGENTS.md`. It never creates,
+moves, or deletes a nested instruction file. Existing nested files are supplied
+as precedence context so the proposal does not duplicate or weaken their
+guidance.
+
+Change selectors are mutually exclusive:
+
+- no selector compares `HEAD` with the current working tree, including staged,
+  unstaged, and nonignored untracked paths in the applicable scope;
+- `--staged` compares `HEAD` with the index and requires a Git `HEAD`, no
+  unstaged tracked changes, and no nonignored untracked files;
+- `--since REF` resolves `REF` to a commit and compares it through the current
+  working tree;
+- `--run ID` uses only paths safely attributable to the immutable ctx run
+  baseline and fails closed when files were already dirty or attribution is
+  unavailable.
+
+Incremental review of an existing instruction file requires a Git `HEAD`. The
+only no-`HEAD` exception is synthesizing a missing root `AGENTS.md` from the
+bounded current snapshot.
+
+Review strictly validates the ctx graph, inventories a filtered snapshot, and
+supplies Codex with bounded change routing plus current authoritative source.
+Deleted historical line bodies are redacted. Codex can propose only complete
+bytes for the one allowed file and must cite copied evidence. A missing or
+contradictory corpus, unsafe target, project race, unsupported adapter, or need
+for a new nested scope fails closed or produces `review-required`.
+
+The exact staged-commit workflow is:
+
+```text
+git add <changed-source-paths>
+ctx agents review --staged
+ctx agents show-plan PLAN_ID
+ctx agents apply PLAN_ID
+git diff -- AGENTS.md
+git add AGENTS.md
+ctx reconcile
+git diff -- .ctx
+git add .ctx
+ctx status --check
+git commit
+```
+
+Run `ctx agents prompt --staged` before review to print the exact prompt ctx
+would pass to Codex. Prompt and show-plan are model-free and mutation-free.
+Review is the only step here that invokes Codex, and it saves its
+content-addressed plan under `CTX_HOME` without writing the project. Apply
+rejects a stale plan, a changed selector or evidence set, a changed destination,
+invalid context, and `review-required`; it does not invoke a second model call.
+No agents command stages, commits, pushes, or runs automatically from the Git
+hook. After applying and staging operational guidance, `ctx reconcile`
+separately updates or acknowledges semantic context and refreshes the lock.
 
 ### Read and hydrate
 
@@ -304,6 +406,38 @@ They do not autonomously infer whether durable meaning changed and do not edit
 source or manifests. A human or the active agent must review evidence and make
 any durable manifest edit through normal repository tooling, or explicitly
 acknowledge an implementation-only change.
+
+### Git pre-commit freshness reminder
+
+```text
+ctx integrate git --hooks [--project PATH] [--block]
+```
+
+This create-only integration installs a project Git `pre-commit` hook. The
+default hook is warning-only: it runs `ctx status --check` against the current
+working tree, remains silent when everything is fresh, and otherwise tells the
+developer to run `ctx reconcile`, review and stage the intended `.ctx` files,
+then retry. Because the warning variant reads the working tree rather than
+Git's staged blobs, it does not claim that a partially staged commit and its
+staged lock are consistent.
+
+`--block` opts into enforcement. The blocking hook refuses unstaged tracked
+changes and nonignored untracked files before checking freshness, so the
+working tree represents the staged index. A stale, unknown, or invalid result
+then stops the commit. This conservative policy deliberately disallows partial
+commits; stage or stash the other work before retrying.
+
+The hook never invokes a model, runs reconciliation, modifies a manifest or
+lock, changes the Git index, or creates a commit. It resolves `ctx` from the
+hook process `PATH`. A different existing `pre-commit` hook and any configured
+`core.hooksPath` are preserved rather than overwritten or merged. Default Git
+hooks are shared by linked worktrees, so the generated hook derives the active
+worktree root at runtime and exits silently when that root has no
+`.ctx/context.yaml`. Choose warning or blocking mode at installation because a
+different canonical variant is not silently substituted later.
+`git commit --no-verify` bypasses the check. A missing root manifest that
+remains tracked in the index or `HEAD` also warns or blocks; intentionally
+decommissioning ctx requires removing the installed hook.
 
 ## Compatibility aliases
 

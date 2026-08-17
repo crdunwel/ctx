@@ -129,6 +129,34 @@ result.write_text(json.dumps(payload, sort_keys=True) + "\\n", encoding="utf-8")
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertTrue(json.loads(status.stdout)["fresh"])
 
+    @unittest.skipIf(os.name == "nt", "requires symlink support")
+    def test_dependency_symlink_is_excluded_from_guarded_reconciliation(self) -> None:
+        dependency_target = self.base / "shared-node-modules"
+        dependency_target.mkdir()
+        dependency_link = self.project / "node_modules"
+        try:
+            dependency_link.symlink_to(dependency_target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        seal_freshness(self.project)
+        baseline = self.run_ctx("status", "--check", "--json")
+        self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+        baseline_status = json.loads(baseline.stdout)
+        self.assertEqual(baseline_status["nodes"][0]["files"], 1)
+        self.source.write_text("VALUE = 2\n", encoding="utf-8")
+        _directory, environment = self.fake_codex()
+        record = self.base / "dependency-symlink-snapshot.json"
+        environment["FAKE_RECONCILE_RECORD"] = str(record)
+
+        result = self.run_ctx("reconcile", extra_environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied = set(json.loads(record.read_text(encoding="utf-8")))
+        self.assertNotIn("node_modules", copied)
+        status = self.run_ctx("status", "--check", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertTrue(json.loads(status.stdout)["fresh"])
+
     def test_explicit_acknowledgement_is_two_word_no_agent_path(self) -> None:
         manifest = self.project / ".ctx" / "context.yaml"
         before = manifest.read_bytes()

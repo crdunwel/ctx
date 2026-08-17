@@ -661,6 +661,29 @@ class RetrofitInspectionCorpusTests(unittest.TestCase):
         self.assertEqual(coverage[0].evidence, (hostile_path,))
         self.assertEqual(conflicts, ())
 
+    def test_root_review_area_accepts_nested_project_evidence(self) -> None:
+        coverage, conflicts = retrofit_agent._parse_review_envelope(
+            [
+                {
+                    "area": ".",
+                    "disposition": "node",
+                    "scope": ".ctx/context.yaml",
+                    "evidence": ["src/application.py"],
+                    "summary": "The project root is supported by nested source evidence.",
+                }
+            ],
+            [],
+            code="test.invalid",
+            allowed_areas=(".",),
+            allowed_evidence=frozenset({"src/application.py"}),
+            inspectable_evidence=frozenset({"src/application.py"}),
+            allowed_scopes=frozenset({".ctx/context.yaml"}),
+        )
+
+        self.assertEqual(coverage[0].area, ".")
+        self.assertEqual(coverage[0].evidence, ("src/application.py",))
+        self.assertEqual(conflicts, ())
+
     def test_json_media_relationships_complete_a_source_output_pair(self) -> None:
         root = self.base / "relationship-project"
         (root / "public" / "data").mkdir(parents=True)

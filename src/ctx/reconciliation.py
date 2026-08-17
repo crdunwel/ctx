@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import selectors
 import secrets
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -50,11 +52,21 @@ from .retrofit_agent import (
     _root_identity,
     _temporary_parent,
     _write_all,
+    _write_snapshot_bytes,
 )
 from .schema import parse_manifest
 from .uri import ContextUri, parse_ctx_uri
 from .validation import ValidationResult, validate_project
 from .yamlio import MAX_MANIFEST_BYTES, load_yaml
+
+
+_RECONCILE_DIFF_PATH = ".ctx-retrofit-reconcile-diff.patch"
+_MAX_RECONCILE_DIFF_BYTES = 131_072
+_MAX_RECONCILE_DIFF_PATHS = 256
+_MAX_RECONCILE_DIFF_ARGUMENT_BYTES = 65_536
+_MAX_UNTRACKED_HEADER_CHARACTERS = 2_048
+_RECONCILE_DIFF_SECONDS = 5.0
+_REDACTED_DELETION = b"-[deleted line content redacted by ctx]"
 
 
 _RECONCILE_SCHEMA: dict[str, Any] = {
@@ -114,6 +126,16 @@ class ReconcileResult:
     summary: str
     dry_run: bool
     lock: LockResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconcileDiffEvidence:
+    content: bytes
+    status: str
+    candidate_paths: int
+    selected_paths: int
+    truncated: bool
+    limitation: str | None
 
 
 @dataclass(slots=True)
@@ -309,6 +331,408 @@ def _linked_inspection_paths(status: ProjectStatus) -> frozenset[str]:
     return frozenset(selected)
 
 
+def _bounded_diff_paths(paths: frozenset[str]) -> tuple[tuple[str, ...], bool]:
+    selected: list[str] = []
+    argument_bytes = 0
+    for relative in sorted(paths):
+        encoded_size = len(os.fsencode(relative)) + 1
+        if (
+            len(selected) >= _MAX_RECONCILE_DIFF_PATHS
+            or argument_bytes + encoded_size > _MAX_RECONCILE_DIFF_ARGUMENT_BYTES
+        ):
+            return tuple(selected), True
+        selected.append(relative)
+        argument_bytes += encoded_size
+    return tuple(selected), False
+
+
+def _stop_git_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _read_bounded_git_output(
+    process: subprocess.Popen[bytes],
+) -> tuple[bytes, bool, bool, int]:
+    """Read a child pipe without ever retaining more than the patch budget."""
+
+    assert process.stdout is not None
+    maximum = _MAX_RECONCILE_DIFF_BYTES - 4_096
+    output = bytearray()
+    truncated = False
+    timed_out = False
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + _RECONCILE_DIFF_SECONDS
+    try:
+        eof = False
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _stop_git_process(process)
+                break
+            events = selector.select(timeout=min(0.1, remaining))
+            if not events:
+                continue
+            for key, _mask in events:
+                allowance = maximum + 1 - len(output)
+                if allowance <= 0:
+                    truncated = True
+                    _stop_git_process(process)
+                    eof = True
+                    break
+                chunk = os.read(key.fd, min(65_536, allowance))
+                if not chunk:
+                    eof = True
+                    break
+                output.extend(chunk)
+                if len(output) > maximum:
+                    truncated = True
+                    _stop_git_process(process)
+                    eof = True
+                    break
+        if not timed_out and not truncated:
+            try:
+                return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _stop_git_process(process)
+                return_code = process.returncode if process.returncode is not None else -1
+        else:
+            return_code = process.returncode if process.returncode is not None else -1
+    except BaseException:
+        _stop_git_process(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+    return bytes(output[:maximum]), truncated, timed_out, return_code
+
+
+def _redact_deleted_patch_lines(patch: bytes) -> bytes:
+    """Hide historical-only deleted bodies while preserving hunk geometry."""
+
+    rendered: list[bytes] = []
+    in_hunk = False
+    for line in patch.splitlines(keepends=True):
+        if line.startswith(b"diff --git "):
+            in_hunk = False
+        elif line.startswith(b"@@ "):
+            in_hunk = True
+        if in_hunk and line.startswith(b"-"):
+            if line.endswith(b"\r\n"):
+                ending = b"\r\n"
+            elif line.endswith(b"\n"):
+                ending = b"\n"
+            else:
+                ending = b""
+            rendered.append(_REDACTED_DELETION + ending)
+        else:
+            rendered.append(line)
+    return b"".join(rendered)
+
+
+def _diff_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(name, None)
+    for name in tuple(environment):
+        if name.startswith("GIT_CONFIG_KEY_") or name.startswith("GIT_CONFIG_VALUE_"):
+            environment.pop(name, None)
+    environment["GIT_PAGER"] = "cat"
+    environment["LC_ALL"] = "C"
+    return environment
+
+
+def _render_diff_evidence(
+    *,
+    patch: bytes,
+    status: str,
+    candidate_paths: int,
+    selected_paths: int,
+    untracked_paths: tuple[str, ...],
+    truncated: bool,
+    limitation: str | None,
+) -> _ReconcileDiffEvidence:
+    header_lines = [
+        "# ctx generated reconciliation change evidence",
+        "# This temporary file is not project source, is not citeable as an artifact, and may be incomplete.",
+        "# Basis: Git HEAD to the current working tree (staged plus unstaged changes).",
+        f"# Status: {status}",
+        f"# Allowed paths queried: {selected_paths} of {candidate_paths}",
+        "# Deleted line bodies are redacted; hunk locations and one marker per deleted line are preserved.",
+        "# Current snapshot source and deterministic freshness fingerprints remain authoritative.",
+    ]
+    if untracked_paths:
+        rendered_untracked: list[str] = []
+        rendered_characters = 2
+        for relative in untracked_paths:
+            encoded = json.dumps(relative, ensure_ascii=True)
+            separator = 2 if rendered_untracked else 0
+            if (
+                rendered_characters + separator + len(encoded)
+                > _MAX_UNTRACKED_HEADER_CHARACTERS
+            ):
+                break
+            rendered_untracked.append(encoded)
+            rendered_characters += separator + len(encoded)
+        suffix = ""
+        if len(rendered_untracked) < len(untracked_paths):
+            suffix = f" ({len(untracked_paths) - len(rendered_untracked)} more omitted)"
+        header_lines.append(
+            "# Untracked current-source additions; inspect these snapshot files: ["
+            + ", ".join(rendered_untracked)
+            + "]"
+            + suffix
+        )
+    if limitation is not None:
+        header_lines.append(f"# Limitation: {limitation}")
+    header = ("\n".join(header_lines) + "\n\n").encode("utf-8")
+    marker = b"\n# [ctx reconciliation diff truncated]\n"
+    content = header + patch
+    if len(content) > _MAX_RECONCILE_DIFF_BYTES:
+        truncated = True
+        available = max(0, _MAX_RECONCILE_DIFF_BYTES - len(header) - len(marker))
+        bounded = patch[:available]
+        if b"\n" in bounded:
+            bounded = bounded.rsplit(b"\n", 1)[0] + b"\n"
+        content = header + bounded + marker
+    return _ReconcileDiffEvidence(
+        content=content,
+        status=status,
+        candidate_paths=candidate_paths,
+        selected_paths=selected_paths,
+        truncated=truncated,
+        limitation=limitation,
+    )
+
+
+def _collect_untracked_paths(
+    root: Path, selected: tuple[str, ...]
+) -> tuple[tuple[str, ...], str | None]:
+    command = [
+        "git",
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        str(root),
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        *selected,
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_diff_environment(),
+        )
+    except OSError:
+        return (), "Untracked-path Git evidence was unavailable."
+    raw, truncated, timed_out, return_code = _read_bounded_git_output(process)
+    if timed_out:
+        return (), "Untracked-path inspection exceeded its hard time limit."
+    if truncated:
+        return (), "Untracked-path inspection exceeded its hard byte limit."
+    if return_code != 0:
+        return (), "Untracked-path Git evidence was unavailable."
+    allowed = set(selected)
+    untracked: set[str] = set()
+    for encoded in raw.split(b"\0"):
+        if not encoded:
+            continue
+        relative = os.fsdecode(encoded).replace(os.sep, "/")
+        if relative in allowed:
+            untracked.add(relative)
+    return tuple(sorted(untracked)), None
+
+
+def _collect_reconcile_diff(
+    root: Path, allowed_paths: frozenset[str]
+) -> _ReconcileDiffEvidence:
+    selected, path_truncated = _bounded_diff_paths(allowed_paths)
+    limitations: list[str] = []
+    if path_truncated:
+        limitations.append("The allowed path set exceeded the bounded query limit.")
+    if not selected:
+        limitations.append("No copied affected eligible source paths were available for a Git diff.")
+        return _render_diff_evidence(
+            patch=b"",
+            status="current-source-only",
+            candidate_paths=len(allowed_paths),
+            selected_paths=0,
+            untracked_paths=(),
+            truncated=path_truncated,
+            limitation=" ".join(limitations),
+        )
+
+    untracked_paths, untracked_limitation = _collect_untracked_paths(root, selected)
+    if untracked_limitation is not None:
+        limitations.append(untracked_limitation)
+
+    command = [
+        "git",
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "color.ui=false",
+        "-C",
+        str(root),
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=all",
+        "--unified=3",
+        "HEAD",
+        "--",
+        *selected,
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_diff_environment(),
+        )
+    except OSError:
+        limitations.append("Git or a usable Git HEAD was unavailable; inspect current source directly.")
+        return _render_diff_evidence(
+            patch=b"",
+            status="unavailable",
+            candidate_paths=len(allowed_paths),
+            selected_paths=len(selected),
+            untracked_paths=untracked_paths,
+            truncated=path_truncated,
+            limitation=" ".join(limitations),
+        )
+
+    raw, output_truncated, timed_out, return_code = _read_bounded_git_output(process)
+    if timed_out:
+        limitations.append("Git diff exceeded its hard time limit; inspect current source directly.")
+        raw = b""
+        status = "timeout"
+    elif return_code != 0 and not output_truncated:
+        limitations.append("Git or a usable Git HEAD was unavailable; inspect current source directly.")
+        raw = b""
+        status = "unavailable"
+    elif output_truncated:
+        limitations.append("Git diff exceeded its hard byte limit and was truncated.")
+        status = "truncated"
+    elif path_truncated:
+        status = "truncated"
+    elif raw:
+        status = "available"
+    elif untracked_paths:
+        limitations.append(
+            "Untracked additions have no Git patch hunks; inspect their current snapshot files."
+        )
+        status = "available"
+    else:
+        limitations.append("No eligible uncommitted Git changes were present in the bounded path set.")
+        status = "clean"
+    return _render_diff_evidence(
+        patch=_redact_deleted_patch_lines(raw),
+        status=status,
+        candidate_paths=len(allowed_paths),
+        selected_paths=len(selected),
+        untracked_paths=untracked_paths,
+        truncated=path_truncated or output_truncated,
+        limitation=" ".join(limitations) or None,
+    )
+
+
+def _materialize_reconcile_diff(
+    snapshot_root: Path, evidence: _ReconcileDiffEvidence
+) -> None:
+    snapshot_fd = _open_snapshot_directory(snapshot_root)
+    if snapshot_fd is None:  # pragma: no cover - guarded callers are POSIX-only
+        raise CtxError(
+            "reconcile.platform-unsupported",
+            "guarded reconciliation requires no-follow directory descriptors",
+            exit_code=4,
+        )
+    try:
+        _write_snapshot_bytes(snapshot_fd, _RECONCILE_DIFF_PATH, evidence.content)
+    finally:
+        os.close(snapshot_fd)
+
+
+def _remove_reconcile_diff(
+    snapshot_root: Path, evidence: _ReconcileDiffEvidence
+) -> None:
+    snapshot_fd = _open_snapshot_directory(snapshot_root)
+    if snapshot_fd is None:  # pragma: no cover - guarded callers are POSIX-only
+        raise CtxError(
+            "reconcile.platform-unsupported",
+            "guarded reconciliation requires no-follow directory descriptors",
+            exit_code=4,
+        )
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(_RECONCILE_DIFF_PATH, flags, dir_fd=snapshot_fd)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o400:
+            raise CtxError(
+                "reconcile.snapshot-invalid",
+                "generated reconciliation diff changed type or mode before validation",
+                exit_code=4,
+            )
+        chunks: list[bytes] = []
+        remaining = _MAX_RECONCILE_DIFF_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if b"".join(chunks) != evidence.content:
+            raise CtxError(
+                "reconcile.snapshot-invalid",
+                "generated reconciliation diff changed before validation",
+                exit_code=4,
+            )
+        os.close(descriptor)
+        descriptor = None
+        os.unlink(_RECONCILE_DIFF_PATH, dir_fd=snapshot_fd)
+    except FileNotFoundError as exc:
+        raise CtxError(
+            "reconcile.snapshot-invalid",
+            "generated reconciliation diff disappeared before validation",
+            exit_code=4,
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(snapshot_fd)
+
+
 def _evidence_sections(root: Path, node: LoadedNode) -> dict[str, Any]:
     referenced_by: dict[str, list[str]] = {}
     item_evidence: list[dict[str, Any]] = []
@@ -396,6 +820,13 @@ artifacts or tracking paths, and never infer uninspected contents.
 Affected manifests and their declared artifacts are required complete evidence;
 the run fails closed when they cannot fit. Catalog relationship records may
 identify bounded source/output media pairs selected for end-to-end inspection.
+
+`{_RECONCILE_DIFF_PATH}` is generated, bounded, supplemental change evidence.
+It describes only an allowed subset of Git HEAD-to-current working-tree changes
+and may report that Git is unavailable, clean, timed out, or truncated. Deleted
+line bodies are redacted. Read its metadata before using it, never cite it as an
+artifact or tracking path, and never treat it as complete. Current snapshot
+source and deterministic freshness fingerprints remain authoritative.
 """
     return f"""CTX_RECONCILE_PROMPT_VERSION=1
 
@@ -651,6 +1082,12 @@ def _prepare(
         ):
             raise CtxError(
                 "reconcile.agent-output-invalid", f"manifest content is noncanonical or too large: {relative}", exit_code=1
+            )
+        if _RECONCILE_DIFF_PATH.casefold() in content.casefold():
+            raise CtxError(
+                "reconcile.agent-output-invalid",
+                f"proposal references generated reconciliation diff evidence: {relative}",
+                exit_code=1,
             )
         temporary = work_directory / f"reconcile-{index}.yaml"
         temporary.write_text(content, encoding="utf-8", newline="\n")
@@ -1316,15 +1753,25 @@ def reconcile_project(
                 root_fd, reviewable_manifest_paths
             )
             required_inspection_paths = _required_inspection_paths(before)
+            scoped_inspection_paths = _scoped_inspection_paths(before, inventory)
             inspection = _build_filtered_snapshot(
                 inventory,
                 root_fd,
                 snapshot,
-                inspection_paths=_scoped_inspection_paths(before, inventory),
+                inspection_paths=scoped_inspection_paths,
                 mandatory_paths=_scoped_mandatory_paths(before, inventory),
                 required_paths=required_inspection_paths,
                 manual_command="ctx reconcile --prompt",
             )
+            diff_allowed_paths = (
+                frozenset(inspection.copied_paths)
+                & frozenset(inventory.eligible_files)
+                & scoped_inspection_paths
+            )
+            diff_evidence = _collect_reconcile_diff(
+                before.root, diff_allowed_paths
+            )
+            _materialize_reconcile_diff(snapshot, diff_evidence)
             result_path = _run_codex(
                 inventory,
                 before,
@@ -1333,6 +1780,7 @@ def reconcile_project(
                 inspection,
             )
             manifests, acknowledgements, summary = _read_output(result_path)
+            _remove_reconcile_diff(snapshot, diff_evidence)
             proposals, parsed_acknowledgements = _prepare(
                 before, manifests, acknowledgements, work
             )

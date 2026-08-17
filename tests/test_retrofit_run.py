@@ -314,6 +314,21 @@ if mode == "root-only-uncovered":
 
 proposal["coverage"] = coverage
 proposal["conflicts"] = []
+if mode in {
+    "invalid-evidence-once",
+    "invalid-evidence-always",
+    "invalid-evidence-then-source-change",
+}:
+    first_attempt = not Path(os.environ["FAKE_CODEX_RECORD"]).exists()
+    if mode == "invalid-evidence-always" or first_attempt:
+        fixture_coverage = next(
+            item for item in coverage if item["area"] == "tests/fixtures"
+        )
+        fixture_coverage["evidence"] = [
+            "tests/fixtures/invented_missing_fixture.html"
+        ]
+    elif mode == "invalid-evidence-then-source-change":
+        (live_root / "app.py").write_text("CHANGED = True\\n", encoding="utf-8")
 if mode == "review-required":
     inspected = next(
         (
@@ -504,6 +519,10 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assertIn(
             "proposed/existing `.ctx/context.yaml` path", normalized_prompt
         )
+        self.assertIn(
+            "copied verbatim from a `files[].path` value", normalized_prompt
+        )
+        self.assertIn("check every cited path against that exact set", normalized_prompt)
         self.assertEqual(schema["additionalProperties"], False)
         return snapshot_root
 
@@ -1130,6 +1149,101 @@ Path(os.environ["FAKE_CODEX_RECORD"]).write_text(
         self.assertTrue((self.ctx_home / "registry.json").is_file())
         self.assert_canonical_project_hooks(project)
         self.assertIn("hooks created", applied.stdout)
+
+    def test_dry_run_retries_once_when_agent_invents_coverage_evidence(self) -> None:
+        project = self.base / "invalid-evidence-retry-project"
+        fixtures = project / "tests" / "fixtures"
+        fixtures.mkdir(parents=True)
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        (fixtures / "existing.html").write_text("<p>fixture</p>\n", encoding="utf-8")
+        executable_directory, record = self.install_fake_codex()
+
+        result = self.run_ctx(
+            "retrofit",
+            str(project),
+            "--dry-run",
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="invalid-evidence-once",
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("retrying the semantic review once", result.stderr)
+        self.assertIn("Review exact proposal: ctx retrofit --show-plan ", result.stdout)
+        invocation = self.read_invocation(record)
+        prompt = str(invocation["stdin"])
+        self.assertIn("Deterministic evidence correction", prompt)
+        self.assertIn("copy every coverage and conflict evidence path verbatim", prompt)
+        plan_id = result.stdout.split("ctx retrofit --show-plan ", 1)[1].split()[0]
+        plan = json.loads(
+            (self.ctx_home / "retrofit-plans" / f"{plan_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fixture_coverage = next(
+            item for item in plan["coverage"] if item["area"] == "tests/fixtures"
+        )
+        self.assertEqual(
+            fixture_coverage["evidence"], ["tests/fixtures/existing.html"]
+        )
+
+    def test_dry_run_stops_after_one_invalid_evidence_retry(self) -> None:
+        project = self.base / "invalid-evidence-bounded-retry-project"
+        fixtures = project / "tests" / "fixtures"
+        fixtures.mkdir(parents=True)
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        (fixtures / "existing.html").write_text("<p>fixture</p>\n", encoding="utf-8")
+        executable_directory, record = self.install_fake_codex()
+
+        result = self.run_ctx(
+            "retrofit",
+            str(project),
+            "--dry-run",
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="invalid-evidence-always",
+            ),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("retrying the semantic review once", result.stderr)
+        self.assertIn("references evidence outside the bounded inventory", result.stderr)
+        self.assertIn(
+            "Deterministic evidence correction",
+            str(self.read_invocation(record)["stdin"]),
+        )
+        self.assertFalse((self.ctx_home / "retrofit-plans").exists())
+
+    def test_invalid_evidence_retry_still_rejects_source_changes(self) -> None:
+        project = self.base / "invalid-evidence-source-race-project"
+        fixtures = project / "tests" / "fixtures"
+        fixtures.mkdir(parents=True)
+        (project / "app.py").write_text("READY = True\n", encoding="utf-8")
+        (fixtures / "existing.html").write_text("<p>fixture</p>\n", encoding="utf-8")
+        executable_directory, record = self.install_fake_codex()
+
+        result = self.run_ctx(
+            "retrofit",
+            str(project),
+            "--dry-run",
+            environment_overrides=self.fake_environment(
+                executable_directory,
+                record,
+                project,
+                mode="invalid-evidence-then-source-change",
+            ),
+        )
+
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("retrying the semantic review once", result.stderr)
+        self.assertIn("retrofit.source-changed", result.stderr)
+        self.assertFalse((self.ctx_home / "retrofit-plans").exists())
+        self.assertFalse((project / ".ctx").exists())
 
     def test_root_only_dry_run_exposes_unresolved_inventory_areas(self) -> None:
         project = self.base / "root-only-coverage-project"

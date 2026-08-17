@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$project_root"
+
+bootstrap_python="${CTX_BOOTSTRAP_PYTHON:-python3}"
+
+if [[ ! -x .venv/bin/python ]]; then
+  "$bootstrap_python" -c 'import sys; sys.exit("ctx development requires Python 3.11+") if sys.version_info < (3, 11) else None'
+  "$bootstrap_python" -m venv .venv
+fi
+
+.venv/bin/python -c 'import sys; sys.exit("the existing .venv uses Python older than 3.11; recreate it") if sys.version_info < (3, 11) else None'
+.venv/bin/python -m pip install -e .

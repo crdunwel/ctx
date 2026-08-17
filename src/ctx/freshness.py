@@ -21,6 +21,7 @@ from .diagnostics import CtxError, UnsafePathError
 from .models import LoadedNode
 from .paths import is_secret_path, is_within, resolved_project_path
 from .retrofit import (
+    HARD_EXCLUDED_DIRECTORIES,
     MAX_FILES,
     RetrofitInventory,
     _open_child_directory_no_follow,
@@ -167,17 +168,6 @@ def _tracked_symlinks(root: Path, inventory: RetrofitInventory) -> tuple[str, ..
     eligible_parents = {str(PurePosixPath(value).parent) for value in inventory.eligible_files}
     stack = [root]
     seen = 0
-    excluded = {
-        ".git",
-        ".ctx",
-        ".venv",
-        "node_modules",
-        "vendor",
-        "build",
-        "dist",
-        "target",
-        "__pycache__",
-    }
     while stack:
         directory = stack.pop()
         try:
@@ -192,11 +182,16 @@ def _tracked_symlinks(root: Path, inventory: RetrofitInventory) -> tuple[str, ..
             relative = path.relative_to(root).as_posix()
             try:
                 if entry.is_symlink():
-                    if not is_secret_path(path, root):
+                    lowered_name = entry.name.casefold()
+                    if (
+                        lowered_name not in HARD_EXCLUDED_DIRECTORIES
+                        and not lowered_name.endswith((".egg-info", ".dist-info"))
+                        and not is_secret_path(path, root)
+                    ):
                         candidates.append(relative)
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    if entry.name.casefold() not in excluded and (
+                    if entry.name.casefold() not in HARD_EXCLUDED_DIRECTORIES and (
                         relative in eligible_parents
                         or any(parent.startswith(relative + "/") for parent in eligible_parents)
                     ):

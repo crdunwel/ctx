@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,32 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 class DocumentationSurfaceTests(unittest.TestCase):
+    def test_development_runtime_is_pinned_and_agent_safe(self) -> None:
+        agents = (REPOSITORY / "AGENTS.md").read_text(encoding="utf-8")
+        contributing = (REPOSITORY / "CONTRIBUTING.md").read_text(
+            encoding="utf-8"
+        )
+        envrc = (REPOSITORY / ".envrc").read_text(encoding="utf-8")
+        codex_environment = tomllib.loads(
+            (REPOSITORY / ".codex" / "environments" / "environment.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        bootstrap = REPOSITORY / "scripts" / "bootstrap"
+
+        self.assertEqual(
+            (REPOSITORY / ".python-version").read_text(encoding="utf-8").strip(),
+            "3.12.6",
+        )
+        self.assertIn(".venv/bin/python", agents)
+        self.assertIn(".venv/bin/ctx", agents)
+        self.assertIn("./scripts/bootstrap", contributing)
+        self.assertIn("PATH_add .venv/bin", envrc)
+        self.assertEqual(codex_environment["version"], 1)
+        self.assertIn("./scripts/bootstrap", codex_environment["setup"]["script"])
+        self.assertTrue(bootstrap.stat().st_mode & 0o111)
+        subprocess.run(["bash", "-n", str(bootstrap)], check=True)
+
     def test_readme_has_model_free_first_value_path(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
 
@@ -35,6 +63,58 @@ class DocumentationSurfaceTests(unittest.TestCase):
                 self.assertIn("multiple files concurrently", normalized)
                 self.assertIn("does not create a", normalized)
                 self.assertIn("ctx integrate codex --hooks --user", normalized)
+
+    def test_docs_define_git_freshness_hook_boundaries(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        cli_reference = (REPOSITORY / "docs" / "CLI.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, document in (("README", readme), ("CLI reference", cli_reference)):
+            with self.subTest(document=name):
+                normalized = " ".join(document.split())
+                self.assertIn("ctx integrate git --hooks", normalized)
+                self.assertIn("ctx reconcile", normalized)
+                self.assertIn("warning", normalized.lower())
+                self.assertIn("working tree", normalized.lower())
+                self.assertIn("staged", normalized.lower())
+                self.assertIn("never invokes a model", normalized.lower())
+                self.assertIn("core.hooksPath", normalized)
+
+    def test_docs_disclose_bounded_reconcile_diff(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        cli_reference = (REPOSITORY / "docs" / "CLI.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, document in (("README", readme), ("CLI reference", cli_reference)):
+            with self.subTest(document=name):
+                normalized = " ".join(document.split()).lower()
+                self.assertIn("bounded supplemental", normalized)
+                self.assertIn("head", normalized)
+                self.assertIn("working-tree", normalized)
+                self.assertIn("deleted", normalized)
+                self.assertIn("current source", normalized)
+
+    def test_docs_define_guarded_agents_review_boundaries(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        cli_reference = (REPOSITORY / "docs" / "CLI.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, document in (("README", readme), ("CLI reference", cli_reference)):
+            with self.subTest(document=name):
+                normalized = " ".join(document.split()).lower()
+                self.assertIn("ctx agents review --staged", normalized)
+                self.assertIn("ctx agents prompt --staged", normalized)
+                self.assertIn("ctx agents show-plan", normalized)
+                self.assertIn("ctx agents apply", normalized)
+                self.assertIn("content-addressed", normalized)
+                self.assertIn("read-only", normalized)
+                self.assertIn("does not invoke", normalized)
+                self.assertIn("index", normalized)
+                self.assertIn("operational", normalized)
+                self.assertIn("semantic", normalized)
 
 
 if __name__ == "__main__":

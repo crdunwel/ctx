@@ -14,7 +14,7 @@ patterns, and links to related context.
 ## Install
 
 Requires Python 3.11+ and [`pipx`](https://pipx.pypa.io/). The guarded
-agent-assisted `retrofit` and `reconcile` commands also require
+agent-assisted `retrofit`, `reconcile`, and `agents review` commands also require
 [Codex](https://developers.openai.com/codex/cli) installed and signed in; the
 rest of the CLI remains local and agent-neutral.
 
@@ -94,6 +94,84 @@ reading source.” See the official developer-command
 [reference](https://learn.chatgpt.com/docs/developer-commands?surface=app) for
 the commands available on each Codex surface.
 
+### Warn before committing stale context
+
+Install the optional, project-local Git reminder once:
+
+```bash
+ctx integrate git --hooks
+```
+
+The pre-commit hook runs `ctx status --check`. A fresh checkout is silent; a
+stale, unknown, or invalid checkout tells the developer to run `ctx reconcile`,
+review the resulting `.ctx` diff, stage the intended `.ctx` files, and retry.
+The default is warning only. It checks the current working tree rather than
+Git's staged blobs, so it is a reminder—not proof that a partially staged
+commit contains matching context.
+
+For an explicit blocking policy, install the blocking variant instead:
+
+```bash
+ctx integrate git --hooks --block
+```
+
+Blocking mode refuses partial staging and nonignored untracked files; with the
+working tree equal to the index, its freshness result represents the staged
+commit. Choose warning or blocking mode when installing: create-only safety
+preserves a different existing hook rather than replacing or merging it.
+Configured `core.hooksPath` values are also preserved. The generated hook
+resolves `ctx` from `PATH`, never invokes a model, and never edits files,
+stages changes, or commits. `git commit --no-verify` bypasses it. Removing a
+tracked root `.ctx/context.yaml` also
+triggers the reminder; remove the installed hook explicitly when intentionally
+decommissioning ctx for a repository.
+
+### Keep durable agent instructions current
+
+`AGENTS.md` and `.ctx/context.yaml` solve different problems. `AGENTS.md` is
+governing operational guidance: supported runtimes, exact verification
+commands, generated-file rules, and safe editing boundaries. `context.yaml` is
+semantic project data: purpose, canonical artifacts, invariants, decisions,
+patterns, and routing. A context manifest may point to `AGENTS.md` as evidence,
+but it does not replace or override those instructions.
+
+Review the exact staged source change before committing it:
+
+```bash
+git add <changed-source-paths>
+ctx agents review --staged
+ctx agents show-plan PLAN_ID
+ctx agents apply PLAN_ID
+git diff -- AGENTS.md
+git add AGENTS.md
+ctx reconcile
+git diff -- .ctx
+git add .ctx
+ctx status --check
+git commit
+```
+
+`--staged` reviews `HEAD` to the index and deliberately requires no unstaged
+tracked changes or nonignored untracked files. This makes the evidence match
+the staged source. The review invokes Codex against a bounded read-only
+snapshot and saves a content-addressed proposal under `CTX_HOME`; it does not edit the project.
+`show-plan` exposes the exact proposed bytes and evidence, and `apply` rechecks
+the project before atomically writing only the saved `AGENTS.md` proposal. It
+does not invoke Codex again, stage files, or commit. `ctx reconcile` then
+separately reviews whether the same change altered durable semantic context and
+refreshes `.ctx/lock.json`.
+
+To inspect exactly what ctx would ask Codex without invoking a model or saving
+a plan, run:
+
+```bash
+ctx agents prompt --staged
+```
+
+No Git hook runs this workflow automatically. A future instruction change
+should remain an explicit, diff-visible review rather than becoming governing
+text merely because a commit occurred.
+
 ## Try the sample project
 
 Create a complete example without invoking a model:
@@ -136,6 +214,7 @@ an existing ctx project, bare `ctx demo` creates `./ctx-permit-board-demo`.
 | `ctx show [REFERENCE]` | Inspect a project, node, item, or local scope |
 | `ctx status` | Check whether source and context are synchronized |
 | `ctx reconcile` | Review stale context with Codex and refresh it |
+| `ctx agents review [PATH]` | Propose a guarded update to applicable `AGENTS.md` guidance |
 | `ctx validate --strict` | Validate the complete local context graph |
 | `ctx register` | Register an existing context-enabled checkout |
 | `ctx projects` | List registered projects |
@@ -196,6 +275,24 @@ ctx status
 ctx reconcile
 ```
 
+### Review operational guidance from a broader change
+
+```bash
+ctx agents review --since origin/main
+ctx agents show-plan PLAN_ID
+ctx agents apply PLAN_ID
+```
+
+With no selector, review compares `HEAD` with the current working tree,
+including staged, unstaged, and nonignored untracked changes. `--since REF`
+compares a resolved commit with the current working tree; `--run ID` limits the
+review to changes safely attributable to that immutable ctx run. Selectors are
+mutually exclusive. `PATH` chooses the nearest applicable `AGENTS.md` scope.
+V1 may update that one existing file or create a missing root `AGENTS.md`; it
+never invents a new nested instruction file. Existing-file review requires a
+Git `HEAD`; a missing root file may instead be synthesized from a bounded
+current snapshot.
+
 ### Hydrate a specific task or directory
 
 ```bash
@@ -211,12 +308,16 @@ ctx hydrate --task "Use the form pattern from Permit Atlas"
 
 ## Data and trust
 
-Automated `ctx retrofit` and `ctx reconcile` fingerprint every eligible,
+Automated `ctx retrofit`, `ctx reconcile`, and `ctx agents review` fingerprint every eligible,
 nonignored file, then give Codex a separate deterministic inspection corpus.
 Retrofit prioritizes complete source, instructions, contracts, and tests across
 bounded hierarchical project areas. Reconciliation limits model-visible source
 to affected-node ownership and declared evidence while retaining the complete
-fingerprint for race detection. Non-governing text files over 2 MiB and large
+fingerprint for race detection. When Git has a usable `HEAD`, reconciliation
+also supplies a bounded supplemental `HEAD`-to-working-tree diff for already
+copied eligible files; deleted historical line bodies are redacted, untracked
+additions are routed to their current snapshot files, and current source remains
+authoritative. Non-governing text files over 2 MiB and large
 structured files receive bounded labeled previews; media, archives, databases,
 duplicates, and protected top-level data may be represented by metadata or a
 small sample.
